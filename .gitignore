@@ -1,3 +1,9 @@
+# Project data (large CSVs, not tracked in git)
+data/
+
+# Generated output
+output/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
