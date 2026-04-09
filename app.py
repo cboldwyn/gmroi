@@ -463,9 +463,10 @@ def pdf_download_button(df, filter_desc, title, key):
 # DATA LOADING & PREPARATION (one-time, cached)
 # ============================================================================
 
-@st.cache_data(show_spinner="Loading data...")
+@st.cache_resource(show_spinner="Loading data...")
 def load_and_prepare():
-    """Load data from Parquet cache (fast) or build from CSVs (first run)."""
+    """Load data from Parquet cache (fast) or build from CSVs (first run).
+    Uses cache_resource (not cache_data) to avoid pickle serialization overhead."""
     result = load_from_parquet()
     if result[0] is not None:
         return result
@@ -498,7 +499,7 @@ def compute_gmroi(sales, inventory, group_cols, annualize_factor=1.0):
     if len(sales) == 0:
         return pd.DataFrame()
 
-    sales_agg = sales.groupby(group_cols, dropna=False).agg(
+    sales_agg = sales.groupby(group_cols, dropna=False, observed=True).agg(
         Net_Sales=("Net Sales", "sum"),
         COGS=("COGS_Calc", "sum"),
         Qty_Sold=("Quantity Sold", "sum"),
@@ -525,12 +526,12 @@ def compute_gmroi(sales, inventory, group_cols, annualize_factor=1.0):
             inv = inv.rename(columns={inv_col: sales_col})
 
     # Sum inventory per group per DAY (weekly files contain 7 daily snapshots)
-    daily = inv.groupby(group_cols + ["Date"], dropna=False).agg(
+    daily = inv.groupby(group_cols + ["Date"], dropna=False, observed=True).agg(
         Daily_Inv_Value=("Inventory Value", "sum"),
         Daily_Qty=("Quantity on Hand", "sum"),
     ).reset_index()
 
-    avg_inv = daily.groupby(group_cols, dropna=False).agg(
+    avg_inv = daily.groupby(group_cols, dropna=False, observed=True).agg(
         Avg_Inv_Cost=("Daily_Inv_Value", "mean"),
         Avg_Qty_On_Hand=("Daily_Qty", "mean"),
     ).reset_index()
@@ -559,7 +560,7 @@ def compute_monthly_gmroi(sales, inventory, group_col):
         return pd.DataFrame()
 
     # Monthly sales aggregation
-    monthly_sales = sales.groupby([group_col, "Month"], dropna=False).agg(
+    monthly_sales = sales.groupby([group_col, "Month"], dropna=False, observed=True).agg(
         Net_Sales=("Net Sales", "sum"),
         COGS=("COGS_Calc", "sum"),
     ).reset_index()
@@ -574,10 +575,10 @@ def compute_monthly_gmroi(sales, inventory, group_col):
 
     inv["Month"] = inv["Date"].dt.to_period("M")
     # Sum per group per day first, then average across days within each month
-    daily_inv = inv.groupby([group_col, "Month", "Date"], dropna=False).agg(
+    daily_inv = inv.groupby([group_col, "Month", "Date"], dropna=False, observed=True).agg(
         Daily_Inv=("Inventory Value", "sum"),
     ).reset_index()
-    monthly_inv = daily_inv.groupby([group_col, "Month"], dropna=False).agg(
+    monthly_inv = daily_inv.groupby([group_col, "Month"], dropna=False, observed=True).agg(
         Avg_Inv_Cost=("Daily_Inv", "mean"),
     ).reset_index()
 
