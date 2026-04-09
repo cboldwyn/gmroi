@@ -5,8 +5,8 @@ Calculates Gross Margin Return on Inventory Investment.
 GMROI = Gross Margin $ / Average Inventory Cost (at cost)
 
 Where:
-- Gross Margin = Net Sales - COGS
-- COGS = Unit Cost * Quantity Sold (from sales data)
+- Gross Margin = Net Sales - COGS (includes vendor credits + COGS adjustments)
+- COGS = Unit Cost * Quantity Sold - Vendor Pays - COGS Adjustment + Haven Pays
 - Average Inventory Cost = mean of weekly inventory value snapshots
 
 Groupable by: Product, Brand, Category, and combinations thereof.
@@ -19,6 +19,75 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 from loader import load_sales, load_inventory
+
+# Off-system COGS adjustments (must match app.py config)
+COGS_ADJUSTMENTS = {
+    'Stiiizy': [
+        {
+            'start': '2025-01-01', 'end': '2025-10-31',
+            'categories': {'Vape': 0.30},
+            'default': 0.0,
+        },
+        {
+            'start': '2025-11-01', 'end': '2026-01-31',
+            'categories': {'Vape': 0.30, 'Accessories': 0.30},
+            'default': 0.20,
+        },
+    ],
+}
+
+IGNORE_VENDOR_CREDITS_BRANDS = ['Stiiizy']
+
+
+def apply_cogs_adjustments(sales, adjustments=None):
+    """Apply off-system COGS adjustments as % reduction on standard COGS."""
+    if adjustments is None:
+        adjustments = COGS_ADJUSTMENTS
+
+    sales = sales.copy()
+    sales['COGS_Adjustment'] = 0.0
+
+    if not adjustments:
+        return sales
+
+    cat_col = 'Product Category'
+
+    for brand, periods in adjustments.items():
+        brand_mask = sales['Brand'] == brand
+        if brand_mask.sum() == 0:
+            continue
+
+        for period in periods:
+            start = pd.Timestamp(period['start'])
+            end = pd.Timestamp(period['end'])
+            period_mask = brand_mask & (sales['Date'] >= start) & (sales['Date'] <= end)
+
+            if period_mask.sum() == 0:
+                continue
+
+            for category, pct in period.get('categories', {}).items():
+                cat_mask = period_mask & (sales[cat_col] == category)
+                if cat_mask.sum() > 0:
+                    sales.loc[cat_mask, 'COGS_Adjustment'] = (
+                        sales.loc[cat_mask, 'Unit Cost']
+                        * sales.loc[cat_mask, 'Quantity Sold'] * pct
+                    )
+
+            default_pct = period.get('default', 0)
+            if default_pct > 0:
+                already_adjusted = sales['COGS_Adjustment'] > 0
+                remaining = period_mask & ~already_adjusted
+                if remaining.sum() > 0:
+                    sales.loc[remaining, 'COGS_Adjustment'] = (
+                        sales.loc[remaining, 'Unit Cost']
+                        * sales.loc[remaining, 'Quantity Sold'] * default_pct
+                    )
+
+    total = sales['COGS_Adjustment'].sum()
+    if total > 0:
+        print(f"  COGS Adjustments applied: ${total:,.2f}")
+
+    return sales
 
 
 def filter_completed_sales(sales):
@@ -41,7 +110,9 @@ def filter_completed_sales(sales):
 def compute_sales_metrics(sales, group_cols):
     """Aggregate sales data by grouping columns."""
     sales = sales.copy()
-    sales["COGS_Calc"] = sales["Unit Cost"] * sales["Quantity Sold"]
+    sales = apply_cogs_adjustments(sales)
+    sales["COGS_Calc"] = (sales["Unit Cost"] * sales["Quantity Sold"]
+                           - sales["COGS_Adjustment"])
 
     agg = sales.groupby(group_cols, dropna=False).agg(
         Net_Sales=("Net Sales", "sum"),
@@ -81,19 +152,18 @@ def compute_avg_inventory(inventory, group_cols):
         if inv_col in inv.columns and sales_col in group_cols and inv_col != sales_col:
             inv = inv.rename(columns={inv_col: sales_col})
 
-    # Create week period for averaging
-    inv["Week"] = inv["Date"].dt.to_period("W")
-
-    # First: sum inventory value per group per week
-    weekly = inv.groupby(group_cols + ["Week"], dropna=False).agg(
-        Weekly_Inv_Value=("Inventory Value", "sum"),
-        Weekly_Qty_On_Hand=("Quantity on Hand", "sum"),
+    # First: sum inventory value per group per DAY (each daily snapshot
+    # gives one total per group). Weekly files contain 7 daily snapshots,
+    # so we must not sum across days within a week.
+    daily = inv.groupby(group_cols + ["Date"], dropna=False).agg(
+        Daily_Inv_Value=("Inventory Value", "sum"),
+        Daily_Qty_On_Hand=("Quantity on Hand", "sum"),
     ).reset_index()
 
-    # Then: average across weeks
-    avg_inv = weekly.groupby(group_cols, dropna=False).agg(
-        Avg_Inventory_Cost=("Weekly_Inv_Value", "mean"),
-        Avg_Qty_On_Hand=("Weekly_Qty_On_Hand", "mean"),
+    # Then: average across all snapshot dates
+    avg_inv = daily.groupby(group_cols, dropna=False).agg(
+        Avg_Inventory_Cost=("Daily_Inv_Value", "mean"),
+        Avg_Qty_On_Hand=("Daily_Qty_On_Hand", "mean"),
     ).reset_index()
 
     return avg_inv

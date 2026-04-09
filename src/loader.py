@@ -78,8 +78,16 @@ def load_inventory(data_dir="data/inventory"):
         if col in combined.columns:
             combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0)
 
+    # Keep only one snapshot day per week to reduce memory (~7x reduction).
+    # Each weekly file contains 7 daily snapshots with near-identical data.
+    yw = (combined["Date"].dt.isocalendar().year.astype(str)
+          + "-" + combined["Date"].dt.isocalendar().week.astype(str))
+    first_dates = combined.groupby(yw)["Date"].min().values
+    combined = combined[combined["Date"].isin(first_dates)]
+
     print(f"Inventory loaded: {len(combined):,} rows from {len(files)} files")
     print(f"  Date range: {combined['Date'].min().date()} to {combined['Date'].max().date()}")
+    print(f"  Snapshot dates kept: {combined['Date'].nunique()} (1 per week)")
     print(f"  Shops: {combined['Shop'].nunique()}")
     print(f"  Unique products: {combined['Product Name'].nunique()}")
 

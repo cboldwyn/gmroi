@@ -1,12 +1,27 @@
 """
-GMROI Dashboard v2.0.0
+GMROI Dashboard v2.3.0
 Gross Margin Return on Inventory Investment analysis for Haven Cannabis
 
 Provides interactive analysis of product performance across Brand, Category,
 Product, and Shop dimensions with vendor credit integration, monthly trends,
-margin-turnover portfolio analysis, and store-level variance detection.
+margin-turnover portfolio analysis, store-level variance detection,
+COGS adjustments for off-system credits, validation tab, and PDF reports.
 
 CHANGELOG:
+v2.3.0 (2026-03-31)
+- Persistent data: Parquet cache for fast startup (replaces raw CSV reload)
+- Timeframe selector: view data by year, quarter, or custom date range
+- Data management sidebar: rebuild from CSVs, new file detection
+- Vendor credits: glob pattern supports multiple yearly files
+
+v2.2.0 (2026-03-19)
+- COGS Adjustments: off-system credit memos (Stiiizy 30% vape for 2025,
+  20% non-vape from Nov 2025). Date-aware config with sidebar overrides.
+- Stiiizy excluded from vendor credits CSV (credits handled via COGS adjustments)
+- NEW: Validation tab for cross-referencing data against external sources
+- NEW: PDF report generation (one-pager per filtered view)
+- Sidebar controls for Stiiizy non-vape adjustment (% or $ amount)
+
 v2.1.0 (2026-03-10)
 - Flower combine/separate toggle in sidebar (Indica/Sativa/Hybrid)
 - Added requirements.txt
@@ -37,12 +52,28 @@ import plotly.graph_objects as go
 import glob
 import os
 import io
+from datetime import datetime, date
+
+from src.store import (build_from_csvs, load_from_parquet, load_metadata,
+                       detect_new_files)
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                     Paragraph, Spacer)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.1.0"
+VERSION = "2.3.0"
 
 st.set_page_config(
     page_title=f"GMROI Dashboard v{VERSION}",
@@ -53,7 +84,8 @@ st.set_page_config(
 DATA_DIR = "data"
 SALES_DIR = os.path.join(DATA_DIR, "sales")
 INVENTORY_DIR = os.path.join(DATA_DIR, "inventory")
-CREDITS_PATH = os.path.join(DATA_DIR, "2025 Vendor Credits.csv")
+CREDITS_PATTERN = os.path.join(DATA_DIR, "*Vendor Credits*.csv")
+DISTRO_INV_PATH = os.path.join(DATA_DIR, "Daily Inventory Values - Source.csv")
 
 EXCLUDE_CATEGORIES = [
     "Display", "Sample", "Promo", "Compassion", "Donation", "Non-Cannabis",
@@ -62,120 +94,397 @@ EXCLUDE_CATEGORIES = [
 
 FLOWER_CATEGORIES = ["Indica", "Sativa", "Hybrid"]
 
+# Brand consolidation: map variant names to canonical name
+BRAND_CONSOLIDATION = {
+    "Camino Gummies": "Camino",
+}
+
+# Off-system COGS adjustments (credit memos not in vendor credits CSV).
+# Stiiizy credits come via off-system rebates, NOT through the promo credit system.
+# Rates are date-aware to handle deal changes through 2025.
+# From Feb 2026, Distru unit costs already reflect credits (no adjustment needed).
+#
+# Structure: brand -> list of periods with start/end dates and category rates.
+# 'default' applies to categories not explicitly listed.
+# Non-vape can be overridden via sidebar controls (% or $ amount from accounting).
+COGS_ADJUSTMENTS = {
+    'Stiiizy': [
+        {
+            'start': '2025-01-01', 'end': '2025-10-31',
+            'categories': {'Vape': 0.30},
+            'default': 0.0,  # non-vape: adjustable via sidebar
+        },
+        {
+            'start': '2025-11-01', 'end': '2026-01-31',
+            'categories': {'Vape': 0.30, 'Accessories': 0.30},
+            'default': 0.20,  # non-vape 20% upfront from Nov 2025 deal
+        },
+        # Feb 2026+: no adjustment, Distru unit costs already include credits
+    ],
+}
+
+# Brands to EXCLUDE from vendor credits CSV (handled via COGS_ADJUSTMENTS)
+IGNORE_VENDOR_CREDITS_BRANDS = ['Stiiizy']
+
 # Portfolio quadrant thresholds: set dynamically from median of data
 # GMROI iso-line values to draw on scatter plot
 GMROI_ISO_VALUES = [1.0, 2.0, 3.0, 5.0]
+
+
+def apply_cogs_adjustments(sales, adjustments=None, nonvape_override=None):
+    """
+    Apply off-system COGS adjustments as % reduction on standard COGS.
+
+    These are rebates received outside the promo credit system. They reduce
+    True COGS without changing the base Unit Cost in the data.
+
+    Args:
+        sales: DataFrame with Brand, Product Category, Unit Cost, Quantity Sold, Date
+        adjustments: COGS_ADJUSTMENTS config dict (defaults to module-level config)
+        nonvape_override: dict with optional sidebar overrides, e.g.
+            {'Stiiizy': {'mode': 'pct', 'value': 0.15}} or
+            {'Stiiizy': {'mode': 'dollar', 'value': 60862, 'start': '...', 'end': '...'}}
+
+    Returns:
+        DataFrame with COGS_Adjustment column added
+    """
+    if adjustments is None:
+        adjustments = COGS_ADJUSTMENTS
+
+    sales = sales.copy()
+    sales['COGS_Adjustment'] = 0.0
+
+    if not adjustments:
+        return sales
+
+    cat_col = 'Product Category'
+    adjustment_log = []
+
+    for brand, periods in adjustments.items():
+        brand_mask = sales['Brand'] == brand
+        if brand_mask.sum() == 0:
+            continue
+
+        for period in periods:
+            start = pd.Timestamp(period['start'])
+            end = pd.Timestamp(period['end'])
+            period_mask = brand_mask & (sales['Date'] >= start) & (sales['Date'] <= end)
+
+            if period_mask.sum() == 0:
+                continue
+
+            standard_cogs = sales.loc[period_mask, 'Unit Cost'] * sales.loc[period_mask, 'Quantity Sold']
+            category_pcts = period.get('categories', {})
+            default_pct = period.get('default', 0)
+
+            # Apply category-specific rates first
+            for category, pct in category_pcts.items():
+                cat_mask = period_mask & (sales[cat_col] == category)
+                cat_count = cat_mask.sum()
+                if cat_count > 0:
+                    cat_cogs = sales.loc[cat_mask, 'Unit Cost'] * sales.loc[cat_mask, 'Quantity Sold']
+                    adj_amount = cat_cogs * pct
+                    sales.loc[cat_mask, 'COGS_Adjustment'] = adj_amount
+                    adjustment_log.append(
+                        f"{brand} / {category} ({period['start']} to {period['end']}): "
+                        f"{cat_count:,} rows x {pct:.0%} = ${adj_amount.sum():,.0f}"
+                    )
+
+            # Apply default rate to remaining (not already adjusted in this period)
+            if default_pct > 0:
+                already_adjusted = sales['COGS_Adjustment'] > 0
+                remaining = period_mask & ~already_adjusted
+                remaining_count = remaining.sum()
+                if remaining_count > 0:
+                    rem_cogs = sales.loc[remaining, 'Unit Cost'] * sales.loc[remaining, 'Quantity Sold']
+                    adj_amount = rem_cogs * default_pct
+                    sales.loc[remaining, 'COGS_Adjustment'] = adj_amount
+                    cats = ', '.join(sorted(sales.loc[remaining, cat_col].unique()))
+                    adjustment_log.append(
+                        f"{brand} / Other [{cats}] ({period['start']} to {period['end']}): "
+                        f"{remaining_count:,} rows x {default_pct:.0%} = ${adj_amount.sum():,.0f}"
+                    )
+
+        # Apply non-vape sidebar override if provided
+        if nonvape_override and brand in nonvape_override:
+            override = nonvape_override[brand]
+            # Find non-vape rows for this brand that haven't been adjusted
+            # (or override existing non-vape adjustments)
+            nonvape_mask = brand_mask & ~sales[cat_col].isin(
+                [cat for p in periods for cat in p.get('categories', {}).keys()]
+            )
+            if override['mode'] == 'pct' and override['value'] > 0:
+                pct = override['value']
+                nv_cogs = sales.loc[nonvape_mask, 'Unit Cost'] * sales.loc[nonvape_mask, 'Quantity Sold']
+                sales.loc[nonvape_mask, 'COGS_Adjustment'] = nv_cogs * pct
+                adjustment_log.append(
+                    f"{brand} / Non-Vape (sidebar override): "
+                    f"{nonvape_mask.sum():,} rows x {pct:.0%} = ${(nv_cogs * pct).sum():,.0f}"
+                )
+            elif override['mode'] == 'dollar' and override['value'] > 0:
+                total_dollar = override['value']
+                # Distribute pro-rata by COGS weight
+                nv_cogs = sales.loc[nonvape_mask, 'Unit Cost'] * sales.loc[nonvape_mask, 'Quantity Sold']
+                total_nv_cogs = nv_cogs.sum()
+                if total_nv_cogs > 0:
+                    sales.loc[nonvape_mask, 'COGS_Adjustment'] = nv_cogs / total_nv_cogs * total_dollar
+                    adjustment_log.append(
+                        f"{brand} / Non-Vape (sidebar $ override): "
+                        f"${total_dollar:,.0f} distributed across {nonvape_mask.sum():,} rows"
+                    )
+
+    # Store log for sidebar display
+    st.session_state['cogs_adjustment_log'] = adjustment_log
+    st.session_state['cogs_adjustment_total'] = sales['COGS_Adjustment'].sum()
+
+    return sales
+
+
+def format_currency(value):
+    """Format a number as currency string."""
+    if abs(value) >= 1_000_000:
+        return f"${value:,.0f}"
+    elif abs(value) >= 1_000:
+        return f"${value:,.0f}"
+    else:
+        return f"${value:,.2f}"
+
+
+def generate_gmroi_report_pdf(df, filter_info, title="GMROI Report"):
+    """
+    Generate a print-ready PDF one-pager for a GMROI filtered view.
+    Returns PDF bytes, or None if reportlab not available.
+    """
+    if not HAS_REPORTLAB:
+        return None
+
+    # Compute summary metrics
+    total_sales = df["Net_Sales"].sum()
+    total_cogs = df["COGS"].sum()
+    total_gm = df["Gross_Margin"].sum()
+    total_avg_inv = df["Avg_Inv_Cost"].sum() if "Avg_Inv_Cost" in df.columns else 0
+    gmroi = total_gm / total_avg_inv if total_avg_inv > 0 else 0
+    margin_pct = total_gm / total_sales * 100 if total_sales > 0 else 0
+    turns = total_cogs / total_avg_inv if total_avg_inv > 0 else 0
+    credits = df["Vendor_Credits"].sum() if "Vendor_Credits" in df.columns else 0
+    cogs_adj = df["COGS_Adj"].sum() if "COGS_Adj" in df.columns else 0
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter,
+                            leftMargin=0.5*inch, rightMargin=0.5*inch,
+                            topMargin=0.4*inch, bottomMargin=0.4*inch)
+
+    elements = []
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'],
+                                  fontSize=16, textColor=colors.HexColor('#2E7D32'),
+                                  spaceAfter=2)
+    subtitle_style = ParagraphStyle('Subtitle', parent=styles['Normal'],
+                                     fontSize=8, textColor=colors.gray, spaceAfter=6)
+
+    # Build filter description
+    filter_desc = filter_info if isinstance(filter_info, str) else "All Data"
+
+    # Header
+    header_data = [
+        [Paragraph(f"<b>{title}</b>", title_style),
+         '',
+         Paragraph(f"<b>{len(df):,}</b> items",
+                   ParagraphStyle('Right', parent=styles['Normal'],
+                                  fontSize=12, alignment=TA_RIGHT))]
+    ]
+    header_table = Table(header_data, colWidths=[4*inch, 1.5*inch, 2*inch])
+    header_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (-1, 0), (-1, 0), 'RIGHT'),
+    ]))
+    elements.append(header_table)
+
+    elements.append(Paragraph(
+        f"{datetime.now().strftime('%B %d, %Y')} - Haven Cannabis - <i>{filter_desc}</i>",
+        subtitle_style))
+    elements.append(Spacer(1, 6))
+
+    # Hero metrics
+    hero_style = ParagraphStyle('Hero', parent=styles['Normal'], fontSize=22,
+                                 alignment=TA_CENTER, textColor=colors.white, leading=24)
+    hero_label_style = ParagraphStyle('HeroLabel', parent=styles['Normal'], fontSize=8,
+                                       alignment=TA_CENTER,
+                                       textColor=colors.HexColor('#E8F5E9'))
+
+    hero_data = [
+        [Paragraph("<b>GMROI</b>", hero_label_style),
+         Paragraph("<b>MARGIN %</b>", hero_label_style),
+         Paragraph("<b>GROSS MARGIN</b>", hero_label_style)],
+        [Paragraph(f"<b>{gmroi:.2f}</b>", hero_style),
+         Paragraph(f"<b>{margin_pct:.1f}%</b>", hero_style),
+         Paragraph(f"<b>{format_currency(total_gm)}</b>", hero_style)],
+    ]
+    hero_table = Table(hero_data, colWidths=[2.5*inch]*3,
+                       rowHeights=[0.22*inch, 0.38*inch])
+    hero_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#2E7D32')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, 0), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 0),
+        ('TOPPADDING', (0, 1), (-1, 1), 2),
+        ('BOTTOMPADDING', (0, 1), (-1, 1), 6),
+    ]))
+    elements.append(hero_table)
+    elements.append(Spacer(1, 6))
+
+    # Detail metrics
+    detail_label_style = ParagraphStyle('DetailLabel', parent=styles['Normal'],
+                                         fontSize=7, alignment=TA_CENTER,
+                                         textColor=colors.gray)
+    detail_value_style = ParagraphStyle('DetailValue', parent=styles['Normal'],
+                                         fontSize=11, alignment=TA_CENTER,
+                                         fontName='Helvetica-Bold')
+
+    detail_labels = ["NET SALES", "COGS", "INV TURNS", "AVG INV COST",
+                     "VENDOR CREDITS", "COGS ADJ"]
+    detail_values = [
+        format_currency(total_sales), format_currency(total_cogs),
+        f"{turns:.2f}", format_currency(total_avg_inv),
+        format_currency(credits), format_currency(cogs_adj),
+    ]
+
+    detail_data = [
+        [Paragraph(l, detail_label_style) for l in detail_labels],
+        [Paragraph(v, detail_value_style) for v in detail_values],
+    ]
+    detail_table = Table(detail_data, colWidths=[1.25*inch]*6,
+                          rowHeights=[0.2*inch, 0.3*inch])
+    detail_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FAFAFA')),
+        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, 0), 4),
+        ('BOTTOMPADDING', (0, -1), (-1, -1), 4),
+    ]))
+    elements.append(detail_table)
+    elements.append(Spacer(1, 10))
+
+    # Data table
+    th_style = ParagraphStyle('TableHeader', parent=styles['Normal'], fontSize=8,
+                               textColor=colors.white, fontName='Helvetica-Bold')
+    td_style = ParagraphStyle('TableCell', parent=styles['Normal'], fontSize=8)
+    td_right = ParagraphStyle('TableCellRight', parent=styles['Normal'],
+                               fontSize=8, alignment=TA_RIGHT)
+
+    # Determine group columns (everything that's not a metric)
+    metric_set = set(METRIC_COLS)
+    group_cols = [c for c in df.columns if c not in metric_set]
+    display_group_cols = group_cols[:2]  # Max 2 group columns in PDF
+
+    table_headers = display_group_cols + ["GMROI", "Margin %", "Gross Margin",
+                                          "Net Sales", "Turns", "Qty"]
+    table_data = [[Paragraph(h, th_style) for h in table_headers]]
+
+    sorted_df = df.sort_values("GMROI", ascending=False)
+    max_rows = min(len(sorted_df), 40)
+
+    for _, row in sorted_df.head(max_rows).iterrows():
+        row_data = []
+        for col in display_group_cols:
+            val = str(row.get(col, ''))
+            if len(val) > 30:
+                val = val[:27] + '...'
+            row_data.append(Paragraph(val, td_style))
+        row_data.extend([
+            Paragraph(f"{row.get('GMROI', 0):.2f}", td_right),
+            Paragraph(f"{row.get('Margin_Pct', 0):.1f}%", td_right),
+            Paragraph(format_currency(row.get('Gross_Margin', 0)), td_right),
+            Paragraph(format_currency(row.get('Net_Sales', 0)), td_right),
+            Paragraph(f"{row.get('Inv_Turns', 0):.1f}", td_right),
+            Paragraph(f"{row.get('Qty_Sold', 0):,.0f}", td_right),
+        ])
+        table_data.append(row_data)
+
+    # Column widths
+    n_groups = len(display_group_cols)
+    group_width = 1.8 if n_groups == 1 else 1.2
+    metric_width = (7.5 - group_width * n_groups) / 6
+    col_widths = [group_width * inch] * n_groups + [metric_width * inch] * 6
+
+    product_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    product_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2E7D32')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('TOPPADDING', (0, 0), (-1, 0), 6),
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 3),
+        ('TOPPADDING', (0, 1), (-1, -1), 3),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1),
+         [colors.white, colors.HexColor('#FAFAFA')]),
+        ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+        ('ALIGN', (n_groups, 0), (-1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    elements.append(product_table)
+
+    if len(sorted_df) > max_rows:
+        elements.append(Spacer(1, 4))
+        footer_style = ParagraphStyle('Footer', parent=styles['Normal'],
+                                        fontSize=7, textColor=colors.gray,
+                                        alignment=TA_CENTER)
+        elements.append(Paragraph(
+            f"Showing top {max_rows} of {len(sorted_df)} items by GMROI",
+            footer_style))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def pdf_download_button(df, filter_desc, title, key):
+    """Render a PDF download button if reportlab is available."""
+    if not HAS_REPORTLAB:
+        return
+    pdf_bytes = generate_gmroi_report_pdf(df, filter_desc, title)
+    if pdf_bytes:
+        st.download_button(
+            label="📄 Download PDF Report",
+            data=pdf_bytes,
+            file_name=f"{title.lower().replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            key=key,
+        )
 
 
 # ============================================================================
 # DATA LOADING & PREPARATION (one-time, cached)
 # ============================================================================
 
-@st.cache_data(show_spinner="Loading and preparing data...")
+@st.cache_data(show_spinner="Loading data...")
 def load_and_prepare():
-    """Load sales, inventory, credits. Clean, merge, return ready DataFrames."""
-    # -- Sales --
-    sales_files = sorted(glob.glob(os.path.join(SALES_DIR, "*.csv")))
-    if not sales_files:
-        return None, None
+    """Load data from Parquet cache (fast) or build from CSVs (first run)."""
+    result = load_from_parquet()
+    if result[0] is not None:
+        return result
+    # No cache yet: build from CSVs
+    sales, inventory = build_from_csvs(
+        SALES_DIR, INVENTORY_DIR, CREDITS_PATTERN, version=VERSION
+    )
+    metadata = load_metadata()
+    return sales, inventory, metadata
 
-    frames = []
-    for f in sales_files:
-        df = pd.read_csv(f, encoding="utf-8-sig", low_memory=False)
-        frames.append(df)
 
-    sales = pd.concat(frames, ignore_index=True)
-    sales["Date"] = pd.to_datetime(sales["Date"], errors="coerce")
-    sales = sales.dropna(subset=["Date"])
-
-    numeric_cols = ["Quantity Sold", "Unit Cost", "Net Sales",
-                    "Effective Retail Price", "Gross Sales"]
-    for col in numeric_cols:
-        if col in sales.columns:
-            sales[col] = pd.to_numeric(sales[col], errors="coerce").fillna(0)
-
-    if "Unique ID" in sales.columns and "Trans No" in sales.columns:
-        sales = sales.drop_duplicates(
-            subset=["Date", "Shop", "Trans No", "Unique ID", "Product ID"],
-            keep="first"
-        )
-
-    if "Trans Status" in sales.columns:
-        sales = sales[sales["Trans Status"] == "Completed"]
-    if "Trans Type" in sales.columns:
-        sales = sales[sales["Trans Type"] == "Sale"]
-
-    sales = sales[~sales["Product Category"].isin(EXCLUDE_CATEGORIES)]
-
-    # -- Inventory --
-    inv_files = sorted(glob.glob(os.path.join(INVENTORY_DIR, "*.csv")))
-    if not inv_files:
-        return None, None
-
-    frames = []
-    for f in inv_files:
-        df = pd.read_csv(f, encoding="utf-8-sig", low_memory=False)
-        frames.append(df)
-
-    inventory = pd.concat(frames, ignore_index=True)
-    inventory["Date"] = pd.to_datetime(inventory["Date"], format="%m/%d/%Y",
-                                        errors="coerce")
-    inventory = inventory.dropna(subset=["Date"])
-
-    for col in ["Quantity on Hand", "Unit Cost", "Inventory Value"]:
-        if col in inventory.columns:
-            inventory[col] = pd.to_numeric(inventory[col],
-                                            errors="coerce").fillna(0)
-
-    inventory = inventory[~inventory["Product Category"].isin(EXCLUDE_CATEGORIES)]
-
-    # -- Vendor Credits --
-    credits_df = None
-    if os.path.exists(CREDITS_PATH):
-        credits_df = pd.read_csv(CREDITS_PATH, encoding="utf-8-sig",
-                                  low_memory=False)
-        for col in ["Vendor Pays", "Haven Pays"]:
-            if col in credits_df.columns:
-                credits_df[col] = pd.to_numeric(credits_df[col],
-                                                 errors="coerce").fillna(0)
-        if "Trans No" in credits_df.columns:
-            credits_df["Trans No"] = pd.to_numeric(credits_df["Trans No"],
-                                                     errors="coerce")
-
-    # -- Apply Credits --
-    sales["Vendor_Pays"] = 0.0
-    sales["Haven_Pays"] = 0.0
-
-    if credits_df is not None and not credits_df.empty:
-        credits_df = credits_df.copy()
-        credits_df["_product_lower"] = (credits_df["Product"].astype(str)
-                                         .str.lower().str.strip())
-        credit_agg = credits_df.groupby(["Trans No", "_product_lower"]).agg(
-            Vendor_Pays=("Vendor Pays", "sum"),
-            Haven_Pays=("Haven Pays", "sum"),
-        ).reset_index()
-
-        sales["_product_lower"] = (sales["Product"].astype(str)
-                                    .str.lower().str.strip())
-        sales = sales.merge(
-            credit_agg,
-            left_on=["Trans No", "_product_lower"],
-            right_on=["Trans No", "_product_lower"],
-            how="left", suffixes=("", "_credit")
-        )
-        sales["Vendor_Pays"] = sales["Vendor_Pays_credit"].fillna(0)
-        sales["Haven_Pays"] = sales["Haven_Pays_credit"].fillna(0)
-        sales = sales.drop(columns=["Vendor_Pays_credit", "Haven_Pays_credit",
-                                     "_product_lower"])
-
-    # True COGS per line
+def apply_adjustments_to_sales(sales, nonvape_override=None):
+    """Apply COGS adjustments post-cache (uses session_state for logging)."""
+    sales = apply_cogs_adjustments(sales, nonvape_override=nonvape_override)
+    # Recalculate COGS_Calc with adjustments
     sales["COGS_Calc"] = (sales["Unit Cost"] * sales["Quantity Sold"]
-                           - sales["Vendor_Pays"] + sales["Haven_Pays"])
-
-    # Month column for trend analysis
-    sales["Month"] = sales["Date"].dt.to_period("M")
-
-    return sales, inventory
+                           - sales["Vendor_Pays"] - sales["COGS_Adjustment"]
+                           + sales["Haven_Pays"])
+    return sales
 
 
 # ============================================================================
@@ -195,6 +504,9 @@ def compute_gmroi(sales, inventory, group_cols):
         Avg_Sell_Price=("Effective Retail Price", "mean"),
         Avg_Unit_Cost=("Unit Cost", "mean"),
         Vendor_Credits=("Vendor_Pays", "sum"),
+        **({
+            "COGS_Adj": ("COGS_Adjustment", "sum"),
+        } if "COGS_Adjustment" in sales.columns else {}),
     ).reset_index()
 
     sales_agg["Gross_Margin"] = sales_agg["Net_Sales"] - sales_agg["COGS"]
@@ -210,15 +522,15 @@ def compute_gmroi(sales, inventory, group_cols):
         if inv_col in inv.columns and sales_col in group_cols:
             inv = inv.rename(columns={inv_col: sales_col})
 
-    inv["Week"] = inv["Date"].dt.to_period("W")
-    weekly = inv.groupby(group_cols + ["Week"], dropna=False).agg(
-        Weekly_Inv_Value=("Inventory Value", "sum"),
-        Weekly_Qty=("Quantity on Hand", "sum"),
+    # Sum inventory per group per DAY (weekly files contain 7 daily snapshots)
+    daily = inv.groupby(group_cols + ["Date"], dropna=False).agg(
+        Daily_Inv_Value=("Inventory Value", "sum"),
+        Daily_Qty=("Quantity on Hand", "sum"),
     ).reset_index()
 
-    avg_inv = weekly.groupby(group_cols, dropna=False).agg(
-        Avg_Inv_Cost=("Weekly_Inv_Value", "mean"),
-        Avg_Qty_On_Hand=("Weekly_Qty", "mean"),
+    avg_inv = daily.groupby(group_cols, dropna=False).agg(
+        Avg_Inv_Cost=("Daily_Inv_Value", "mean"),
+        Avg_Qty_On_Hand=("Daily_Qty", "mean"),
     ).reset_index()
 
     merged = sales_agg.merge(avg_inv, on=group_cols, how="left")
@@ -258,14 +570,19 @@ def compute_monthly_gmroi(sales, inventory, group_col):
             inv = inv.rename(columns={inv_col: sales_col})
 
     inv["Month"] = inv["Date"].dt.to_period("M")
-    monthly_inv = inv.groupby([group_col, "Month"], dropna=False).agg(
-        Avg_Inv_Cost=("Inventory Value", "mean"),
+    # Sum per group per day first, then average across days within each month
+    daily_inv = inv.groupby([group_col, "Month", "Date"], dropna=False).agg(
+        Daily_Inv=("Inventory Value", "sum"),
+    ).reset_index()
+    monthly_inv = daily_inv.groupby([group_col, "Month"], dropna=False).agg(
+        Avg_Inv_Cost=("Daily_Inv", "mean"),
     ).reset_index()
 
     merged = monthly_sales.merge(monthly_inv, on=[group_col, "Month"], how="left")
+    # Annualize monthly GMROI (x12) so break-even at 1.0 is meaningful
     merged["GMROI"] = np.where(
         merged["Avg_Inv_Cost"] > 0,
-        merged["Gross_Margin"] / merged["Avg_Inv_Cost"], np.nan
+        merged["Gross_Margin"] / merged["Avg_Inv_Cost"] * 12, np.nan
     )
 
     # Convert Period to string for plotting
@@ -383,6 +700,7 @@ COLUMN_CONFIG = {
     "Avg_Inv_Cost": st.column_config.NumberColumn("Avg Inv Cost", format="$%,.0f"),
     "Avg_Qty_On_Hand": st.column_config.NumberColumn("Avg Qty On Hand", format="%,.0f"),
     "Vendor_Credits": st.column_config.NumberColumn("Vendor Credits", format="$%,.0f"),
+    "COGS_Adj": st.column_config.NumberColumn("COGS Adj", format="$%,.0f"),
     "Transactions": st.column_config.NumberColumn("Transactions", format="%,.0f"),
     "Total_Sales": st.column_config.NumberColumn("Total Sales", format="$%,.0f"),
     "Shop_Count": st.column_config.NumberColumn("Shops", format="%d"),
@@ -434,20 +752,24 @@ def network_metrics(df):
     margin_pct = total_gm / total_sales * 100 if total_sales > 0 else 0
     turns = total_cogs / total_avg_inv if total_avg_inv > 0 else 0
     credits = df["Vendor_Credits"].sum()
+    cogs_adj = df["COGS_Adj"].sum() if "COGS_Adj" in df.columns else 0
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1:
+    cols = st.columns(7 if cogs_adj > 0 else 6)
+    with cols[0]:
         st.metric("Net Sales", f"${total_sales:,.0f}")
-    with col2:
+    with cols[1]:
         st.metric("Gross Margin", f"${total_gm:,.0f}")
-    with col3:
+    with cols[2]:
         st.metric("Margin %", f"{margin_pct:.1f}%")
-    with col4:
+    with cols[3]:
         st.metric("GMROI", f"{gmroi:.2f}")
-    with col5:
+    with cols[4]:
         st.metric("Inv Turns", f"{turns:.2f}")
-    with col6:
+    with cols[5]:
         st.metric("Vendor Credits", f"${credits:,.0f}")
+    if cogs_adj > 0:
+        with cols[6]:
+            st.metric("COGS Adj", f"${cogs_adj:,.0f}")
 
 
 # ============================================================================
@@ -512,6 +834,9 @@ def build_scatter_chart(data, group_col):
 
     plot_data = data.dropna(subset=["Margin_Pct", "Inv_Turns", "GMROI"]).copy()
     plot_data = plot_data[plot_data["Inv_Turns"] > 0]
+    # Filter out outliers: require minimum $5k sales and margin between -100% and 100%
+    plot_data = plot_data[plot_data["Net_Sales"] >= 5000]
+    plot_data = plot_data[(plot_data["Margin_Pct"] >= -100) & (plot_data["Margin_Pct"] <= 100)]
     if plot_data.empty:
         return None
 
@@ -643,22 +968,119 @@ def build_variance_chart(brand_shop_data, brand_name):
 METRIC_COLS = ["Net_Sales", "COGS", "Gross_Margin", "Margin_Pct",
                "GMROI", "Inv_Turns", "Qty_Sold", "Transactions",
                "Avg_Sell_Price", "Avg_Unit_Cost", "Avg_Inv_Cost",
-               "Avg_Qty_On_Hand", "Vendor_Credits"]
+               "Avg_Qty_On_Hand", "Vendor_Credits", "COGS_Adj"]
+
+
+def build_timeframe_presets(sales):
+    """Generate timeframe presets from the data's actual date range."""
+    min_date = sales["Date"].min().date()
+    max_date = sales["Date"].max().date()
+    presets = {"All Data": (None, None)}
+
+    # Walk years present in data
+    for year in range(min_date.year, max_date.year + 1):
+        year_start = date(year, 1, 1)
+        year_end = date(year, 12, 31)
+        if year_start <= max_date and year_end >= min_date:
+            presets[f"{year} Full Year"] = (year_start, year_end)
+
+        # Quarters within each year
+        for q in range(1, 5):
+            q_start = date(year, (q - 1) * 3 + 1, 1)
+            # Last day of quarter: Q1=3/31, Q2=6/30, Q3=9/30, Q4=12/31
+            q_end_month = q * 3
+            if q_end_month == 6 or q_end_month == 9:
+                q_end = date(year, q_end_month, 30)
+            else:
+                q_end = date(year, q_end_month, 31)
+            # Only include quarters that overlap with actual data
+            if q_start <= max_date and q_end >= min_date:
+                presets[f"Q{q} {year}"] = (q_start, q_end)
+
+    presets["Custom Range"] = "custom"
+    return presets
 
 
 def main():
     st.title(f"📊 GMROI Dashboard v{VERSION}")
-    st.markdown("Gross Margin Return on Inventory Investment - Haven 2025")
 
     # ── Load Data ──
-    sales, inventory = load_and_prepare()
+    sales, inventory, metadata = load_and_prepare()
 
     if sales is None or inventory is None:
         st.error("Could not load data. Check that data/sales/ and "
                  "data/inventory/ contain CSV files.")
         return
 
-    # ── Sidebar ──
+    # ── Sidebar: Timeframe ──
+    st.sidebar.header("Timeframe")
+    presets = build_timeframe_presets(sales)
+    preset_names = list(presets.keys())
+    selected_tf = st.sidebar.selectbox(
+        "Period", preset_names, key="timeframe_select",
+        label_visibility="collapsed"
+    )
+
+    start_date = None
+    end_date = None
+    timeframe_label = selected_tf
+
+    if selected_tf == "Custom Range":
+        data_min = sales["Date"].min().date()
+        data_max = sales["Date"].max().date()
+        col1, col2 = st.sidebar.columns(2)
+        start_date = col1.date_input("From", value=data_min, min_value=data_min,
+                                      max_value=data_max, key="tf_start")
+        end_date = col2.date_input("To", value=data_max, min_value=data_min,
+                                    max_value=data_max, key="tf_end")
+        timeframe_label = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+    elif selected_tf != "All Data":
+        start_date, end_date = presets[selected_tf]
+
+    # Apply timeframe filter
+    if start_date and end_date:
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        sales = sales[(sales["Date"] >= start_ts) & (sales["Date"] <= end_ts)].copy()
+        inventory = inventory[(inventory["Date"] >= start_ts)
+                              & (inventory["Date"] <= end_ts)].copy()
+        if len(sales) == 0:
+            st.warning(f"No sales data in the selected period ({timeframe_label}).")
+            return
+
+    if selected_tf == "All Data":
+        st.markdown("Gross Margin Return on Inventory Investment - Haven")
+    else:
+        st.markdown(f"Gross Margin Return on Inventory Investment - Haven - {timeframe_label}")
+
+    # ── Sidebar: Data Management ──
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Data Management"):
+        if metadata:
+            built = metadata.get("build_timestamp", "unknown")
+            if built != "unknown":
+                built = built[:19].replace("T", " ")
+            st.caption(f"Last built: {built}")
+            dr = metadata.get("sales_date_range", [])
+            if dr:
+                st.caption(f"Sales: {dr[0]} to {dr[1]}")
+            st.caption(f"Sales rows: {metadata.get('sales_row_count', '?'):,}")
+            st.caption(f"Inventory rows: {metadata.get('inventory_row_count', '?'):,}")
+
+            new_sales, new_inv = detect_new_files(SALES_DIR, INVENTORY_DIR, metadata)
+            if new_sales or new_inv:
+                st.info(f"{len(new_sales)} new sales file(s), "
+                        f"{len(new_inv)} new inventory file(s) detected.")
+
+        if st.button("Rebuild Data from CSVs", type="secondary"):
+            with st.spinner("Rebuilding from CSVs..."):
+                build_from_csvs(SALES_DIR, INVENTORY_DIR, CREDITS_PATTERN,
+                                version=VERSION)
+            st.cache_data.clear()
+            st.rerun()
+
+    # ── Sidebar: Settings ──
+    st.sidebar.markdown("---")
     st.sidebar.header("📊 Settings")
 
     # Flower consolidation toggle
@@ -669,13 +1091,64 @@ def main():
              "When OFF, they appear as separate categories."
     )
 
+    # Category exclusion toggles
+    exclude_giveaways = st.sidebar.toggle(
+        "Exclude giveaways & apparel",
+        value=False,
+        help="Remove 'Accessories (under $5)' (giveaway items) and Apparel (staff t-shirts) from analysis."
+    )
+
+    # Apply category exclusions
+    extra_excludes = []
+    if exclude_giveaways:
+        extra_excludes.extend(["Accessories (under $5)", "Apparel"])
+    if extra_excludes:
+        sales = sales.copy()
+        sales = sales[~sales["Product Category"].isin(extra_excludes)]
+        inventory = inventory.copy()
+        inventory = inventory[~inventory["Product Category"].isin(extra_excludes)]
+
     if combine_flower:
         flower_map = {cat: "Flower" for cat in FLOWER_CATEGORIES}
-        sales = sales.copy()
+        if not extra_excludes:
+            sales = sales.copy()
+            inventory = inventory.copy()
         sales["Product Category"] = sales["Product Category"].replace(flower_map)
-        inventory = inventory.copy()
-        inventory["Product Category"] = inventory["Product Category"].replace(
-            flower_map)
+        inventory["Product Category"] = inventory["Product Category"].replace(flower_map)
+
+    # Stiiizy non-vape adjustment controls
+    st.sidebar.markdown("---")
+    st.sidebar.header("Stiiizy Non-Vape Adjustment")
+    st.sidebar.caption(
+        "Vape gets 30% COGS reduction for 2025 (auto-applied). "
+        "Non-vape credits varied by period. Override here with % or $ from accounting."
+    )
+    nv_mode = st.sidebar.radio(
+        "Non-vape adjustment mode:",
+        ["None", "Percentage", "Dollar Amount"],
+        horizontal=True,
+        key="stiiizy_nv_mode",
+    )
+    nonvape_override = None
+    if nv_mode == "Percentage":
+        nv_pct = st.sidebar.number_input(
+            "Non-vape credit %:", min_value=0.0, max_value=50.0,
+            value=0.0, step=1.0, key="stiiizy_nv_pct",
+            help="Applied to all non-vape Stiiizy sales COGS"
+        )
+        if nv_pct > 0:
+            nonvape_override = {'Stiiizy': {'mode': 'pct', 'value': nv_pct / 100}}
+    elif nv_mode == "Dollar Amount":
+        nv_dollar = st.sidebar.number_input(
+            "Total non-vape credit ($):", min_value=0.0,
+            value=0.0, step=1000.0, key="stiiizy_nv_dollar",
+            help="Total credit distributed pro-rata across non-vape Stiiizy COGS"
+        )
+        if nv_dollar > 0:
+            nonvape_override = {'Stiiizy': {'mode': 'dollar', 'value': nv_dollar}}
+
+    # Apply COGS adjustments (post-cache, uses session_state for logging)
+    sales = apply_adjustments_to_sales(sales, nonvape_override=nonvape_override)
 
     st.sidebar.markdown("---")
     st.sidebar.header("📊 Data Summary")
@@ -684,6 +1157,12 @@ def main():
     credit_total = sales["Vendor_Pays"].sum()
     if credit_total > 0:
         st.sidebar.markdown(f"**Vendor Credits:** ${credit_total:,.0f}")
+    cogs_adj_total = st.session_state.get('cogs_adjustment_total', 0)
+    if cogs_adj_total > 0:
+        st.sidebar.markdown(f"**COGS Adjustments:** ${cogs_adj_total:,.0f}")
+        with st.sidebar.expander("COGS Adjustment Breakdown"):
+            for line in st.session_state.get('cogs_adjustment_log', []):
+                st.caption(line)
     st.sidebar.markdown(f"**Categories:** {sales['Product Category'].nunique()}")
     st.sidebar.markdown(f"**Brands:** {sales['Brand'].nunique()}")
     st.sidebar.markdown(f"**Shops:** {sales['Shop'].nunique()}")
@@ -692,11 +1171,19 @@ def main():
     st.sidebar.markdown("---")
     with st.sidebar.expander("📋 Version History"):
         st.markdown(f"""
-**v{VERSION}** (2026-03-10)
+**v{VERSION}** (2026-03-31)
+- Persistent data (Parquet cache)
+- Timeframe selector (year, quarter, custom)
+- Data management sidebar
+
+**v2.2.0** (2026-03-19)
+- COGS Adjustments (Stiiizy off-system credits)
+- Validation tab, PDF reports
+
+**v2.1.0** (2026-03-10)
 - Flower combine/separate toggle
 - Trends, Portfolio, Store Variance tabs
 - True COGS everywhere, sortable columns
-- Filters in main content area
         """)
     st.sidebar.markdown(f"**Version {VERSION}**")
 
@@ -709,6 +1196,7 @@ def main():
         "📈 Trends",
         "🎯 Portfolio",
         "🔀 Store Variance",
+        "✅ Validation",
     ])
 
     # ── TAB 1: By Category ──
@@ -724,6 +1212,8 @@ def main():
             st.markdown("---")
             show_table(cat_data, ["Product Category"] + METRIC_COLS,
                         "gmroi_by_category.csv")
+            pdf_download_button(cat_data, "All Categories",
+                                "GMROI by Category", "pdf_cat")
 
             st.markdown("---")
             st.subheader("Drill Down: Brands within Category")
@@ -750,6 +1240,8 @@ def main():
             st.markdown("---")
             show_table(brand_data, ["Brand"] + METRIC_COLS,
                         "gmroi_by_brand.csv")
+            pdf_download_button(brand_data, "All Brands",
+                                "GMROI by Brand", "pdf_brand")
 
             st.markdown("---")
             st.subheader("Drill Down: Products within Brand")
@@ -807,6 +1299,8 @@ def main():
             st.markdown("---")
             show_table(shop_data, ["Shop"] + METRIC_COLS,
                         "gmroi_by_shop.csv")
+            pdf_download_button(shop_data, "All Shops",
+                                "GMROI by Shop", "pdf_shop")
 
             st.markdown("---")
             st.subheader("Drill Down: Categories within Shop")
@@ -823,8 +1317,8 @@ def main():
 
     # ── TAB 5: Trends ──
     with tabs[4]:
-        st.subheader("📈 GMROI Trends (Monthly)")
-        st.markdown("Monthly GMROI with rolling 3-month average. "
+        st.subheader("📈 GMROI Trends (Monthly, Annualized)")
+        st.markdown("Monthly GMROI annualized (x12) with rolling 3-month average. "
                      "Dashed lines = 3-month rolling avg. "
                      "Red dotted = break-even (1.0). Green dotted = strong (3.0).")
 
@@ -845,7 +1339,11 @@ def main():
 
         # Network-level monthly trend
         st.markdown("---")
-        st.subheader("Network GMROI Trend")
+        st.subheader("Network GMROI Trend (Annualized)")
+        st.caption(
+            "Monthly GMROI annualized (x12) so break-even at 1.0 is comparable to the full-year metric. "
+            "Retail = store inventory only. System-Wide = stores + Distro warehouse."
+        )
         net_monthly = sales.groupby("Month").agg(
             Net_Sales=("Net Sales", "sum"),
             COGS=("COGS_Calc", "sum"),
@@ -854,37 +1352,115 @@ def main():
 
         inv_monthly = inventory.copy()
         inv_monthly["Month"] = inv_monthly["Date"].dt.to_period("M")
-        inv_agg = inv_monthly.groupby("Month").agg(
-            Avg_Inv=("Inventory Value", "mean"),
+        # Sum inventory per day first (each snapshot = total across all products),
+        # then average across days within each month
+        daily_totals = inv_monthly.groupby(["Month", "Date"]).agg(
+            Daily_Total=("Inventory Value", "sum"),
+        ).reset_index()
+        inv_agg = daily_totals.groupby("Month").agg(
+            Avg_Inv=("Daily_Total", "mean"),
         ).reset_index()
 
         net_monthly = net_monthly.merge(inv_agg, on="Month", how="left")
-        net_monthly["GMROI"] = np.where(
+        # Annualize monthly GMROI (multiply by 12) so break-even at 1.0 is meaningful
+        net_monthly["GMROI_Retail"] = np.where(
             net_monthly["Avg_Inv"] > 0,
-            net_monthly["Gross_Margin"] / net_monthly["Avg_Inv"], np.nan
+            net_monthly["Gross_Margin"] / net_monthly["Avg_Inv"] * 12, np.nan
         )
         net_monthly["Month_str"] = net_monthly["Month"].astype(str)
-        net_monthly["Rolling_3m"] = net_monthly["GMROI"].rolling(3, min_periods=3).mean()
+        net_monthly["Rolling_3m_Retail"] = net_monthly["GMROI_Retail"].rolling(
+            3, min_periods=3).mean()
+
+        # Load Distro warehouse inventory for system-wide view
+        distro_inv = None
+        if os.path.exists(DISTRO_INV_PATH):
+            try:
+                distro_raw = pd.read_csv(DISTRO_INV_PATH, encoding="utf-8-sig")
+                distro_raw["Date"] = pd.to_datetime(distro_raw["Date"], errors="coerce")
+                distro_raw["Distro"] = (distro_raw["Distro"].astype(str)
+                                        .str.replace(r'[\$,]', '', regex=True))
+                distro_raw["Distro"] = pd.to_numeric(distro_raw["Distro"],
+                                                      errors="coerce")
+                distro_raw = distro_raw.dropna(subset=["Date", "Distro"])
+                if start_date and end_date:
+                    distro_raw = distro_raw[
+                        (distro_raw["Date"] >= pd.Timestamp(start_date))
+                        & (distro_raw["Date"] <= pd.Timestamp(end_date))
+                    ]
+                distro_raw["Month"] = distro_raw["Date"].dt.to_period("M")
+                distro_inv = distro_raw.groupby("Month").agg(
+                    Distro_Avg_Inv=("Distro", "mean"),
+                ).reset_index()
+            except Exception:
+                distro_inv = None
+
+        if distro_inv is not None and not distro_inv.empty:
+            net_monthly = net_monthly.merge(distro_inv, on="Month", how="left")
+            net_monthly["Distro_Avg_Inv"] = net_monthly["Distro_Avg_Inv"].fillna(0)
+            net_monthly["System_Avg_Inv"] = (net_monthly["Avg_Inv"]
+                                              + net_monthly["Distro_Avg_Inv"])
+            net_monthly["GMROI_System"] = np.where(
+                net_monthly["System_Avg_Inv"] > 0,
+                net_monthly["Gross_Margin"] / net_monthly["System_Avg_Inv"] * 12, np.nan
+            )
+            net_monthly["Rolling_3m_System"] = net_monthly["GMROI_System"].rolling(
+                3, min_periods=3).mean()
 
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
-            x=net_monthly["Month_str"], y=net_monthly["GMROI"],
-            mode="lines+markers", name="Monthly GMROI",
-            line=dict(width=2),
+            x=net_monthly["Month_str"], y=net_monthly["GMROI_Retail"],
+            mode="lines+markers", name="Retail GMROI",
+            line=dict(width=2, color="#2ecc71"),
         ))
         fig2.add_trace(go.Scatter(
-            x=net_monthly["Month_str"], y=net_monthly["Rolling_3m"],
-            mode="lines", name="3-Month Rolling Avg",
-            line=dict(dash="dash", width=2),
+            x=net_monthly["Month_str"], y=net_monthly["Rolling_3m_Retail"],
+            mode="lines", name="Retail 3mo Avg",
+            line=dict(dash="dash", width=1, color="#2ecc71"),
         ))
+
+        if "GMROI_System" in net_monthly.columns:
+            fig2.add_trace(go.Scatter(
+                x=net_monthly["Month_str"], y=net_monthly["GMROI_System"],
+                mode="lines+markers", name="System-Wide GMROI",
+                line=dict(width=2, color="#3498db"),
+            ))
+            fig2.add_trace(go.Scatter(
+                x=net_monthly["Month_str"], y=net_monthly["Rolling_3m_System"],
+                mode="lines", name="System 3mo Avg",
+                line=dict(dash="dash", width=1, color="#3498db"),
+            ))
+
         fig2.add_hline(y=1.0, line_dash="dot", line_color="red",
                         annotation_text="Break-even")
         fig2.update_layout(
             height=400,
-            xaxis_title="Month", yaxis_title="GMROI",
+            xaxis_title="Month", yaxis_title="GMROI (Annualized)",
             hovermode="x unified",
         )
         st.plotly_chart(fig2, use_container_width=True)
+
+        # Show the underlying data
+        if "GMROI_System" in net_monthly.columns:
+            with st.expander("Monthly Data"):
+                trend_display = net_monthly[["Month_str", "Net_Sales", "Gross_Margin",
+                                              "Avg_Inv", "GMROI_Retail",
+                                              "Distro_Avg_Inv", "System_Avg_Inv",
+                                              "GMROI_System"]].copy()
+                trend_display.columns = ["Month", "Net Sales", "Gross Margin",
+                                          "Retail Inv", "Retail GMROI",
+                                          "Distro Inv", "System Inv",
+                                          "System GMROI"]
+                config = {
+                    "Net Sales": st.column_config.NumberColumn(format="$%,.0f"),
+                    "Gross Margin": st.column_config.NumberColumn(format="$%,.0f"),
+                    "Retail Inv": st.column_config.NumberColumn(format="$%,.0f"),
+                    "Retail GMROI": st.column_config.NumberColumn(format="%.2f"),
+                    "Distro Inv": st.column_config.NumberColumn(format="$%,.0f"),
+                    "System Inv": st.column_config.NumberColumn(format="$%,.0f"),
+                    "System GMROI": st.column_config.NumberColumn(format="%.2f"),
+                }
+                st.dataframe(trend_display, use_container_width=True,
+                              hide_index=True, column_config=config)
 
     # ── TAB 6: Portfolio (Margin vs Turns) ──
     with tabs[5]:
@@ -1001,6 +1577,259 @@ to the average. Higher CV = more inconsistent performance across stores.
                                 f"gmroi_{sel_brand}_by_store.csv")
         else:
             st.info("Not enough data for store variance analysis.")
+
+    # ── TAB 8: Validation ──
+    with tabs[7]:
+        st.subheader("✅ Data Validation")
+        st.markdown("""
+Cross-reference tool data against external sources (accounting, Headset, Blaze, Distru)
+to build confidence before using these numbers in presentations or reports.
+        """)
+
+        val_view = st.radio(
+            "View:", ["Vendor Credits by Brand", "COGS Adjustments",
+                      "Net Sales by Brand", "Net Sales by Store",
+                      "Inventory Spot Check", "Data Freshness"],
+            horizontal=True, key="val_view"
+        )
+
+        if val_view == "Vendor Credits by Brand":
+            st.markdown("### Vendor Credits by Brand")
+            st.caption("Compare these totals against what accounting billed to each vendor.")
+            vc = sales.groupby("Brand").agg(
+                Vendor_Credits=("Vendor_Pays", "sum"),
+                Net_Sales=("Net Sales", "sum"),
+                Transactions=("Trans No", "nunique"),
+            ).reset_index()
+            vc = vc[vc["Vendor_Credits"] > 0].sort_values("Vendor_Credits", ascending=False)
+            vc["Credit_Pct_of_Sales"] = np.where(
+                vc["Net_Sales"] > 0,
+                vc["Vendor_Credits"] / vc["Net_Sales"] * 100, 0
+            )
+            config = {
+                "Vendor_Credits": st.column_config.NumberColumn("Vendor Credits", format="$%,.0f"),
+                "Net_Sales": st.column_config.NumberColumn("Net Sales", format="$%,.0f"),
+                "Transactions": st.column_config.NumberColumn("Transactions", format="%,.0f"),
+                "Credit_Pct_of_Sales": st.column_config.NumberColumn("Credits % of Sales", format="%.1f%%"),
+            }
+            st.dataframe(vc, use_container_width=True, hide_index=True,
+                          column_config=config)
+            st.markdown(f"**Total Vendor Credits:** ${vc['Vendor_Credits'].sum():,.0f}")
+
+            # Download
+            csv_buf = io.StringIO()
+            vc.to_csv(csv_buf, index=False)
+            st.download_button("📥 Download CSV", csv_buf.getvalue(),
+                                "vendor_credits_by_brand.csv", "text/csv",
+                                key="dl_val_vc")
+
+        elif val_view == "COGS Adjustments":
+            st.markdown("### COGS Adjustments by Brand")
+            st.caption("Off-system credit memos applied outside the vendor credits CSV.")
+
+            if "COGS_Adjustment" in sales.columns and sales["COGS_Adjustment"].sum() > 0:
+                adj_sales = sales[sales["COGS_Adjustment"] > 0].copy()
+                adj_sales["_Std_COGS"] = adj_sales["Unit Cost"] * adj_sales["Quantity Sold"]
+                ca = adj_sales.groupby(
+                    ["Brand", "Product Category"]
+                ).agg(
+                    COGS_Adjustment=("COGS_Adjustment", "sum"),
+                    Standard_COGS=("_Std_COGS", "sum"),
+                    Net_Sales=("Net Sales", "sum"),
+                    Rows=("Trans No", "count"),
+                ).reset_index()
+                ca["Effective_Rate"] = np.where(
+                    ca["Standard_COGS"] > 0,
+                    ca["COGS_Adjustment"] / ca["Standard_COGS"] * 100, 0
+                )
+                ca = ca.sort_values("COGS_Adjustment", ascending=False)
+
+                config = {
+                    "COGS_Adjustment": st.column_config.NumberColumn("COGS Adj", format="$%,.0f"),
+                    "Standard_COGS": st.column_config.NumberColumn("Std COGS", format="$%,.0f"),
+                    "Net_Sales": st.column_config.NumberColumn("Net Sales", format="$%,.0f"),
+                    "Rows": st.column_config.NumberColumn("Rows", format="%,.0f"),
+                    "Effective_Rate": st.column_config.NumberColumn("Eff. Rate %", format="%.1f%%"),
+                }
+                st.dataframe(ca, use_container_width=True, hide_index=True,
+                              column_config=config)
+                st.markdown(f"**Total COGS Adjustments:** ${ca['COGS_Adjustment'].sum():,.0f}")
+
+                # Show configured adjustments
+                with st.expander("Configured Adjustment Rates"):
+                    for brand, periods in COGS_ADJUSTMENTS.items():
+                        st.markdown(f"**{brand}:**")
+                        for p in periods:
+                            cats = ", ".join(f"{k}: {v:.0%}" for k, v in p.get('categories', {}).items())
+                            default = p.get('default', 0)
+                            st.caption(
+                                f"  {p['start']} to {p['end']}: {cats}"
+                                f"{f', Default: {default:.0%}' if default > 0 else ''}"
+                            )
+                    if IGNORE_VENDOR_CREDITS_BRANDS:
+                        st.caption(f"Brands excluded from vendor credits CSV: "
+                                   f"{', '.join(IGNORE_VENDOR_CREDITS_BRANDS)}")
+
+                # Show log from apply_cogs_adjustments
+                if st.session_state.get('cogs_adjustment_log'):
+                    with st.expander("Adjustment Application Log"):
+                        for line in st.session_state['cogs_adjustment_log']:
+                            st.caption(line)
+            else:
+                st.info("No COGS adjustments applied. Configure in COGS_ADJUSTMENTS "
+                        "or use sidebar Stiiizy controls.")
+
+        elif val_view == "Net Sales by Brand":
+            st.markdown("### Net Sales by Brand (Top 30)")
+            st.caption("Compare against Headset or Blaze brand reports.")
+            brand_sales = sales.groupby("Brand").agg(
+                Net_Sales=("Net Sales", "sum"),
+                Qty_Sold=("Quantity Sold", "sum"),
+                Transactions=("Trans No", "nunique"),
+                Avg_Sell_Price=("Effective Retail Price", "mean"),
+            ).reset_index().sort_values("Net_Sales", ascending=False).head(30)
+
+            config = {
+                "Net_Sales": st.column_config.NumberColumn("Net Sales", format="$%,.0f"),
+                "Qty_Sold": st.column_config.NumberColumn("Qty Sold", format="%,.0f"),
+                "Transactions": st.column_config.NumberColumn("Transactions", format="%,.0f"),
+                "Avg_Sell_Price": st.column_config.NumberColumn("Avg Sell Price", format="$%,.2f"),
+            }
+            st.dataframe(brand_sales, use_container_width=True, hide_index=True,
+                          column_config=config)
+            st.markdown(f"**Total (top 30):** ${brand_sales['Net_Sales'].sum():,.0f} | "
+                        f"**All brands:** ${sales['Net Sales'].sum():,.0f}")
+
+            csv_buf = io.StringIO()
+            brand_sales.to_csv(csv_buf, index=False)
+            st.download_button("📥 Download CSV", csv_buf.getvalue(),
+                                "net_sales_by_brand.csv", "text/csv",
+                                key="dl_val_brand")
+
+        elif val_view == "Net Sales by Store":
+            st.markdown("### Net Sales by Store")
+            st.caption("Compare against Blaze store-level reports.")
+            store_sales = sales.groupby("Shop").agg(
+                Net_Sales=("Net Sales", "sum"),
+                Qty_Sold=("Quantity Sold", "sum"),
+                Transactions=("Trans No", "nunique"),
+                Brands=("Brand", "nunique"),
+                Products=("Product", "nunique"),
+            ).reset_index().sort_values("Net_Sales", ascending=False)
+
+            config = {
+                "Net_Sales": st.column_config.NumberColumn("Net Sales", format="$%,.0f"),
+                "Qty_Sold": st.column_config.NumberColumn("Qty Sold", format="%,.0f"),
+                "Transactions": st.column_config.NumberColumn("Transactions", format="%,.0f"),
+                "Brands": st.column_config.NumberColumn("Brands", format="%d"),
+                "Products": st.column_config.NumberColumn("Products", format="%d"),
+            }
+            st.dataframe(store_sales, use_container_width=True, hide_index=True,
+                          column_config=config)
+            st.markdown(f"**Total:** ${store_sales['Net_Sales'].sum():,.0f}")
+
+            csv_buf = io.StringIO()
+            store_sales.to_csv(csv_buf, index=False)
+            st.download_button("📥 Download CSV", csv_buf.getvalue(),
+                                "net_sales_by_store.csv", "text/csv",
+                                key="dl_val_store")
+
+        elif val_view == "Inventory Spot Check":
+            st.markdown("### Inventory Spot Check")
+            st.caption("Pick a snapshot date and filter to compare against Distru.")
+
+            inv_dates = sorted(inventory["Date"].unique())
+            if inv_dates:
+                selected_date = st.selectbox(
+                    "Snapshot date:",
+                    [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime')
+                     else str(d) for d in inv_dates],
+                    index=len(inv_dates) - 1,
+                    key="val_inv_date"
+                )
+                selected_dt = pd.Timestamp(selected_date)
+
+                spot_inv = inventory[inventory["Date"] == selected_dt]
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    spot_brand = st.selectbox(
+                        "Filter by brand (optional):",
+                        ["All"] + sorted(spot_inv["Brand"].dropna().unique().tolist()),
+                        key="val_inv_brand"
+                    )
+                with col2:
+                    spot_shop = st.selectbox(
+                        "Filter by store (optional):",
+                        ["All"] + sorted(spot_inv["Shop"].dropna().unique().tolist()),
+                        key="val_inv_shop"
+                    )
+
+                if spot_brand != "All":
+                    spot_inv = spot_inv[spot_inv["Brand"] == spot_brand]
+                if spot_shop != "All":
+                    spot_inv = spot_inv[spot_inv["Shop"] == spot_shop]
+
+                if len(spot_inv) > 0:
+                    total_inv_value = spot_inv["Inventory Value"].sum()
+                    total_qty = spot_inv["Quantity on Hand"].sum()
+                    st.metric("Total Inventory Value", f"${total_inv_value:,.0f}")
+                    st.metric("Total Qty on Hand", f"{total_qty:,.0f}")
+
+                    spot_agg = spot_inv.groupby(["Shop", "Brand", "Product Category"]).agg(
+                        Inventory_Value=("Inventory Value", "sum"),
+                        Qty_on_Hand=("Quantity on Hand", "sum"),
+                        SKU_Count=("Product Name", "nunique"),
+                    ).reset_index().sort_values("Inventory_Value", ascending=False)
+
+                    config = {
+                        "Inventory_Value": st.column_config.NumberColumn("Inv Value", format="$%,.0f"),
+                        "Qty_on_Hand": st.column_config.NumberColumn("Qty", format="%,.0f"),
+                        "SKU_Count": st.column_config.NumberColumn("SKUs", format="%d"),
+                    }
+                    st.dataframe(spot_agg, use_container_width=True, hide_index=True,
+                                  column_config=config)
+                else:
+                    st.info("No inventory data for selected filters.")
+            else:
+                st.info("No inventory snapshots loaded.")
+
+        elif val_view == "Data Freshness":
+            st.markdown("### Data Freshness")
+            st.caption("Check that data files are current and complete.")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Sales Data**")
+                sales_files = sorted(glob.glob(os.path.join(SALES_DIR, "*.csv")))
+                st.markdown(f"- Files: {len(sales_files)}")
+                if sales_files:
+                    st.markdown(f"- Oldest: `{os.path.basename(sales_files[0])}`")
+                    st.markdown(f"- Newest: `{os.path.basename(sales_files[-1])}`")
+                st.markdown(f"- Date range: {sales['Date'].min().date()} to {sales['Date'].max().date()}")
+                st.markdown(f"- Total rows: {len(sales):,}")
+
+            with col2:
+                st.markdown("**Inventory Data**")
+                inv_files = sorted(glob.glob(os.path.join(INVENTORY_DIR, "*.csv")))
+                st.markdown(f"- Files: {len(inv_files)}")
+                if inv_files:
+                    st.markdown(f"- Oldest: `{os.path.basename(inv_files[0])}`")
+                    st.markdown(f"- Newest: `{os.path.basename(inv_files[-1])}`")
+                st.markdown(f"- Date range: {inventory['Date'].min().date()} to {inventory['Date'].max().date()}")
+                st.markdown(f"- Snapshot dates: {inventory['Date'].nunique()}")
+
+            st.markdown("---")
+            st.markdown("**Vendor Credits**")
+            import pathlib
+            credits_files = sorted(glob.glob(CREDITS_PATTERN))
+            if credits_files:
+                for cf in credits_files:
+                    cred_size = pathlib.Path(cf).stat().st_size / (1024 * 1024)
+                    st.markdown(f"- File: `{os.path.basename(cf)}` ({cred_size:.1f} MB)")
+                st.markdown(f"- Brands excluded: {', '.join(IGNORE_VENDOR_CREDITS_BRANDS) if IGNORE_VENDOR_CREDITS_BRANDS else 'None'}")
+            else:
+                st.warning("No vendor credits files found.")
 
 
 if __name__ == "__main__":
