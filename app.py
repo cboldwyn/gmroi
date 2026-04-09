@@ -491,8 +491,10 @@ def apply_adjustments_to_sales(sales, nonvape_override=None):
 # COMPUTATION
 # ============================================================================
 
-def compute_gmroi(sales, inventory, group_cols):
-    """Compute GMROI for given grouping columns. COGS includes vendor credits."""
+def compute_gmroi(sales, inventory, group_cols, annualize_factor=1.0):
+    """Compute GMROI for given grouping columns. COGS includes vendor credits.
+    annualize_factor: multiply GMROI and Turns to normalize to annual basis
+    (e.g. 4.0 for a quarter, 12.0 for a month)."""
     if len(sales) == 0:
         return pd.DataFrame()
 
@@ -537,11 +539,12 @@ def compute_gmroi(sales, inventory, group_cols):
 
     merged["GMROI"] = np.where(
         merged["Avg_Inv_Cost"] > 0,
-        merged["Gross_Margin"] / merged["Avg_Inv_Cost"], np.nan
+        merged["Gross_Margin"] / merged["Avg_Inv_Cost"] * annualize_factor,
+        np.nan
     )
     merged["Inv_Turns"] = np.where(
         merged["Avg_Inv_Cost"] > 0,
-        merged["COGS"] / merged["Avg_Inv_Cost"], np.nan
+        merged["COGS"] / merged["Avg_Inv_Cost"] * annualize_factor, np.nan
     )
 
     return merged.sort_values("GMROI", ascending=False)
@@ -591,7 +594,7 @@ def compute_monthly_gmroi(sales, inventory, group_col):
     return merged
 
 
-def compute_store_variance(sales, inventory):
+def compute_store_variance(sales, inventory, annualize_factor=1.0):
     """
     Compute GMROI by Brand x Shop and by Product x Shop.
     Returns DataFrames with variance metrics to identify assortment opportunities.
@@ -600,7 +603,8 @@ def compute_store_variance(sales, inventory):
         return pd.DataFrame(), pd.DataFrame()
 
     # Brand x Shop
-    brand_shop = compute_gmroi(sales, inventory, ["Brand", "Shop"])
+    brand_shop = compute_gmroi(sales, inventory, ["Brand", "Shop"],
+                               annualize_factor)
 
     # For each brand, compute stats across shops
     if not brand_shop.empty:
@@ -738,8 +742,8 @@ def show_table(df, display_cols, download_name):
     )
 
 
-def network_metrics(df):
-    """Display network-level summary metrics."""
+def network_metrics(df, annualize_factor=1.0):
+    """Display network-level summary metrics. GMROI and Turns are annualized."""
     if df.empty:
         st.info("No data matches current filters.")
         return
@@ -748,12 +752,15 @@ def network_metrics(df):
     total_gm = df["Gross_Margin"].sum()
     total_cogs = df["COGS"].sum()
     total_avg_inv = df["Avg_Inv_Cost"].sum()
-    gmroi = total_gm / total_avg_inv if total_avg_inv > 0 else 0
+    gmroi = (total_gm / total_avg_inv * annualize_factor
+             if total_avg_inv > 0 else 0)
     margin_pct = total_gm / total_sales * 100 if total_sales > 0 else 0
-    turns = total_cogs / total_avg_inv if total_avg_inv > 0 else 0
+    turns = (total_cogs / total_avg_inv * annualize_factor
+             if total_avg_inv > 0 else 0)
     credits = df["Vendor_Credits"].sum()
     cogs_adj = df["COGS_Adj"].sum() if "COGS_Adj" in df.columns else 0
 
+    ann_label = " (Ann.)" if annualize_factor != 1.0 else ""
     cols = st.columns(7 if cogs_adj > 0 else 6)
     with cols[0]:
         st.metric("Net Sales", f"${total_sales:,.0f}")
@@ -762,9 +769,9 @@ def network_metrics(df):
     with cols[2]:
         st.metric("Margin %", f"{margin_pct:.1f}%")
     with cols[3]:
-        st.metric("GMROI", f"{gmroi:.2f}")
+        st.metric(f"GMROI{ann_label}", f"{gmroi:.2f}")
     with cols[4]:
-        st.metric("Inv Turns", f"{turns:.2f}")
+        st.metric(f"Inv Turns{ann_label}", f"{turns:.2f}")
     with cols[5]:
         st.metric("Vendor Credits", f"${credits:,.0f}")
     if cogs_adj > 0:
@@ -1048,6 +1055,11 @@ def main():
             st.warning(f"No sales data in the selected period ({timeframe_label}).")
             return
 
+    # Annualization factor: normalize GMROI and Turns to a 365-day basis
+    # so that Q1, Q2, YTD, and full-year periods are directly comparable.
+    actual_days = (sales["Date"].max() - sales["Date"].min()).days + 1
+    annualize_factor = 365 / actual_days if actual_days > 0 else 1.0
+
     if selected_tf == "All Data":
         st.markdown("Gross Margin Return on Inventory Investment - Haven")
     else:
@@ -1205,8 +1217,8 @@ def main():
         fsales, finv = render_filters(sales, inventory, "cat_tab")
         st.markdown("---")
 
-        cat_data = compute_gmroi(fsales, finv, ["Product Category"])
-        network_metrics(cat_data)
+        cat_data = compute_gmroi(fsales, finv, ["Product Category"], annualize_factor)
+        network_metrics(cat_data, annualize_factor)
 
         if not cat_data.empty:
             st.markdown("---")
@@ -1223,7 +1235,7 @@ def main():
             cat_s = fsales[fsales["Product Category"] == selected_cat]
             cat_i = finv[finv["Product Category"] == selected_cat]
             if len(cat_s) > 0:
-                drill = compute_gmroi(cat_s, cat_i, ["Brand"])
+                drill = compute_gmroi(cat_s, cat_i, ["Brand"], annualize_factor)
                 show_table(drill, ["Brand"] + METRIC_COLS,
                             f"gmroi_{selected_cat}_brands.csv")
 
@@ -1233,8 +1245,8 @@ def main():
         fsales, finv = render_filters(sales, inventory, "brand_tab")
         st.markdown("---")
 
-        brand_data = compute_gmroi(fsales, finv, ["Brand"])
-        network_metrics(brand_data)
+        brand_data = compute_gmroi(fsales, finv, ["Brand"], annualize_factor)
+        network_metrics(brand_data, annualize_factor)
 
         if not brand_data.empty:
             st.markdown("---")
@@ -1254,7 +1266,8 @@ def main():
                 b_i = finv[finv["Brand"] == selected_brand]
             if len(b_s) > 0:
                 drill = compute_gmroi(b_s, b_i,
-                                       ["Product", "Product Category"])
+                                       ["Product", "Product Category"],
+                                       annualize_factor)
                 show_table(drill,
                             ["Product", "Product Category"] + METRIC_COLS,
                             f"gmroi_{selected_brand}_products.csv")
@@ -1266,8 +1279,9 @@ def main():
         st.markdown("---")
 
         product_data = compute_gmroi(
-            fsales, finv, ["Product", "Brand", "Product Category"])
-        network_metrics(product_data)
+            fsales, finv, ["Product", "Brand", "Product Category"],
+            annualize_factor)
+        network_metrics(product_data, annualize_factor)
 
         if not product_data.empty:
             st.markdown("---")
@@ -1292,8 +1306,8 @@ def main():
         fsales, finv = render_filters(sales, inventory, "shop_tab")
         st.markdown("---")
 
-        shop_data = compute_gmroi(fsales, finv, ["Shop"])
-        network_metrics(shop_data)
+        shop_data = compute_gmroi(fsales, finv, ["Shop"], annualize_factor)
+        network_metrics(shop_data, annualize_factor)
 
         if not shop_data.empty:
             st.markdown("---")
@@ -1310,7 +1324,7 @@ def main():
             sh_s = fsales[fsales["Shop"] == selected_shop]
             sh_i = finv[finv["Shop"] == selected_shop]
             if len(sh_s) > 0:
-                drill = compute_gmroi(sh_s, sh_i, ["Product Category"])
+                drill = compute_gmroi(sh_s, sh_i, ["Product Category"], annualize_factor)
                 show_table(drill,
                             ["Product Category"] + METRIC_COLS,
                             f"gmroi_{selected_shop}_categories.csv")
@@ -1482,10 +1496,10 @@ Gray dotted curves are GMROI iso-lines (constant GMROI = Margin% x Turns / 100).
                               horizontal=True, key="port_view")
 
         if port_view == "Brand":
-            port_data = compute_gmroi(sales, inventory, ["Brand"])
+            port_data = compute_gmroi(sales, inventory, ["Brand"], annualize_factor)
             fig = build_scatter_chart(port_data, "Brand")
         else:
-            port_data = compute_gmroi(sales, inventory, ["Product Category"])
+            port_data = compute_gmroi(sales, inventory, ["Product Category"], annualize_factor)
             fig = build_scatter_chart(port_data, "Product Category")
 
         if fig:
@@ -1529,7 +1543,8 @@ and a Dog at another may need store-specific allocation.
 to the average. Higher CV = more inconsistent performance across stores.
         """)
 
-        brand_shop, brand_stats = compute_store_variance(sales, inventory)
+        brand_shop, brand_stats = compute_store_variance(sales, inventory,
+                                                              annualize_factor)
 
         if not brand_stats.empty:
             # Filter to brands sold in multiple stores with meaningful volume

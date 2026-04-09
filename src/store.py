@@ -181,6 +181,15 @@ def build_from_csvs(sales_dir, inventory_dir, credits_pattern, version=""):
     sales["COGS_Calc"] = (sales["Unit Cost"] * sales["Quantity Sold"]
                            - sales["Vendor_Pays"] + sales["Haven_Pays"])
 
+    # Convert string columns to categorical (cuts memory ~80%, critical for
+    # Streamlit Cloud's 1 GB limit)
+    for col in ["Shop", "Product", "Product Category", "Brand"]:
+        if col in sales.columns:
+            sales[col] = sales[col].astype("category")
+    for col in ["Shop", "Product Name", "Product Category", "Brand"]:
+        if col in inventory.columns:
+            inventory[col] = inventory[col].astype("category")
+
     # -- Write Parquet --
     sales.to_parquet(SALES_PARQUET, index=False)
     inventory.to_parquet(INVENTORY_PARQUET, index=False)
