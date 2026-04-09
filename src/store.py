@@ -177,13 +177,78 @@ def build_from_csvs(sales_dir, inventory_dir, credits_pattern, version=""):
         if "Brand" in inventory.columns:
             inventory["Brand"] = inventory["Brand"].replace(BRAND_CONSOLIDATION)
 
+    # -- Brand cleansing --
+    # Fix known bad brand values from Blaze (apostrophe stripping, case,
+    # misattribution). Only correct specific known issues.
+    brand_corrections = {
+        # Apostrophe stripping by Blaze
+        "Uncle Arnie s": "Uncle Arnie's",
+        "Dr. Norm s": "Dr. Norm's",
+        "Not Your Father s": "Not Your Father's",
+        "Juicy Jay s": "Juicy Jay's",
+        "Lil Buzzies": "Lil' Buzzies",
+        # Case mismatches
+        "STIIIZY": "Stiiizy",
+        "West Coast cure": "West Coast Cure",
+        "VUZE": "Vuze",
+        "Wvy": "WVY",
+        # Misattributed brands (bad Blaze data)
+        "House Weed": None,       # derive from product name
+        "House Party": None,
+        "No Brand Found": None,
+        "Default Brand": None,
+        "Made": None,             # likely "Made From Dirt" truncated
+    }
+    # Apply static corrections
+    static_fixes = {k: v for k, v in brand_corrections.items() if v is not None}
+    corrected = sales["Brand"].isin(static_fixes).sum()
+    sales["Brand"] = sales["Brand"].replace(static_fixes)
+
+    # For None entries: derive brand from product name ("Brand - Description")
+    # but only if the parsed brand is in the catalog.
+    derive_brands = {k for k, v in brand_corrections.items() if v is None}
+    catalog_path = os.path.join("data", "catalog", "profile_templates.csv")
+    if derive_brands and os.path.exists(catalog_path):
+        _cat = pd.read_csv(catalog_path, encoding="utf-8-sig")
+        brand_canon = {b.lower(): b for b in _cat["Brand"].dropna().unique()}
+        needs_fix = sales["Brand"].isin(derive_brands)
+        if needs_fix.any():
+            parsed = (sales.loc[needs_fix, "Product"].astype(str)
+                      .str.split(" - ", n=1).str[0].str.strip())
+            canonical = parsed.str.lower().map(brand_canon)
+            fixable = canonical.notna()
+            sales.loc[needs_fix & fixable.reindex(sales.index, fill_value=False),
+                      "Brand"] = canonical[fixable].values
+            corrected += fixable.sum()
+
+    if corrected > 0:
+        print(f"  Brand cleansing: {corrected:,} rows corrected")
+
     # Base COGS per line (vendor credits only, COGS adjustments applied post-cache)
     sales["COGS_Calc"] = (sales["Unit Cost"] * sales["Quantity Sold"]
                            - sales["Vendor_Pays"] + sales["Haven_Pays"])
 
+    # -- Profile Template Matching --
+    catalog_path = os.path.join("data", "catalog", "profile_templates.csv")
+    if os.path.exists(catalog_path):
+        from src.matcher import match_products_to_templates
+        catalog = pd.read_csv(catalog_path, encoding="utf-8-sig")
+        unique_products = sales[["Product", "Brand", "Product Category"]].drop_duplicates()
+        template_map = match_products_to_templates(unique_products, catalog)
+        sales["Profile_Template"] = [
+            template_map.get((p, b), "Unmatched")
+            for p, b in zip(sales["Product"], sales["Brand"])
+        ]
+        matched = (sales["Profile_Template"] != "Unmatched").sum()
+        total = len(sales)
+        print(f"  Profile Template matching: {matched:,}/{total:,} "
+              f"({matched/total*100:.1f}%) matched")
+    else:
+        sales["Profile_Template"] = "Unmatched"
+
     # Convert string columns to categorical (cuts memory ~80%, critical for
     # Streamlit Cloud's 1 GB limit)
-    for col in ["Shop", "Product", "Product Category", "Brand"]:
+    for col in ["Shop", "Product", "Product Category", "Brand", "Profile_Template"]:
         if col in sales.columns:
             sales[col] = sales[col].astype("category")
     for col in ["Shop", "Product Name", "Product Category", "Brand"]:

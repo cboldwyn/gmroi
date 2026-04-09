@@ -1,6 +1,7 @@
-# Project data (large CSVs, not tracked in git; track Parquet cache)
+# Project data (large CSVs, not tracked in git; track cache and catalog)
 data/*
 !data/cache/
+!data/catalog/
 
 # Generated output
 output/

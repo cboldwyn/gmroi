@@ -630,6 +630,69 @@ def compute_store_variance(sales, inventory, annualize_factor=1.0):
     return brand_shop, brand_stats
 
 
+def compute_share_metrics(sales, group_cols, annualize_factor=1.0,
+                          inventory=None):
+    """Compute sales metrics, shares, and optionally GMROI/Turns."""
+    if len(sales) == 0:
+        return pd.DataFrame()
+    agg = sales.groupby(group_cols, dropna=False, observed=True).agg(
+        Units_Sold=("Quantity Sold", "sum"),
+        Revenue=("Net Sales", "sum"),
+        COGS=("COGS_Calc", "sum"),
+        Avg_Sell=("Effective Retail Price", "mean"),
+        Avg_Cost=("Unit Cost", "mean"),
+    ).reset_index()
+    agg["Gross_Profit"] = agg["Revenue"] - agg["COGS"]
+    total_units = agg["Units_Sold"].sum()
+    total_rev = agg["Revenue"].sum()
+    total_gp = agg["Gross_Profit"].sum()
+    agg["Units_Share"] = np.where(total_units > 0,
+                                   agg["Units_Sold"] / total_units * 100, 0)
+    agg["Revenue_Share"] = np.where(total_rev > 0,
+                                     agg["Revenue"] / total_rev * 100, 0)
+    agg["GP_Share"] = np.where(total_gp > 0,
+                                agg["Gross_Profit"] / total_gp * 100, 0)
+    agg["Margin_Pct"] = np.where(agg["Revenue"] > 0,
+                                  agg["Gross_Profit"] / agg["Revenue"] * 100, 0)
+
+    # GMROI and Turns from inventory (when available)
+    if inventory is not None and len(inventory) > 0:
+        inv = inventory.copy()
+        if "Product Name" in inv.columns:
+            inv = inv.rename(columns={"Product Name": "Product"})
+        # Only group by columns that exist in inventory
+        inv_group = [c for c in group_cols if c in inv.columns]
+        if inv_group:
+            daily = inv.groupby(inv_group + ["Date"], dropna=False,
+                                observed=True).agg(
+                Daily_Inv=("Inventory Value", "sum")).reset_index()
+            avg_inv = daily.groupby(inv_group, dropna=False,
+                                    observed=True).agg(
+                Avg_Inv_Cost=("Daily_Inv", "mean")).reset_index()
+            agg = agg.merge(avg_inv, on=inv_group, how="left")
+            agg["GMROI"] = np.where(
+                agg["Avg_Inv_Cost"] > 0,
+                agg["Gross_Profit"] / agg["Avg_Inv_Cost"] * annualize_factor,
+                np.nan)
+            agg["Inv_Turns"] = np.where(
+                agg["Avg_Inv_Cost"] > 0,
+                agg["COGS"] / agg["Avg_Inv_Cost"] * annualize_factor,
+                np.nan)
+
+    return agg.sort_values("Units_Sold", ascending=False)
+
+
+def build_store_matrix(sales, col_col, value_col="Quantity Sold"):
+    """Pivot: rows = Shop, columns = col_col, values = sum of value_col."""
+    pivot = sales.pivot_table(
+        index="Shop", columns=col_col, values=value_col,
+        aggfunc="sum", fill_value=0, observed=True
+    )
+    pivot["Total"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("Total", ascending=False)
+    return pivot
+
+
 # ============================================================================
 # FILTER HELPERS
 # ============================================================================
@@ -716,6 +779,9 @@ COLUMN_CONFIG = {
     "GMROI_Max": st.column_config.NumberColumn("GMROI Max", format="%.2f"),
     "GMROI_Range": st.column_config.NumberColumn("GMROI Range", format="%.2f"),
     "GMROI_CV": st.column_config.NumberColumn("CV %", format="%.1f%%"),
+    "Units_Share": st.column_config.NumberColumn("Units Share %", format="%.1f%%"),
+    "Revenue_Share": st.column_config.NumberColumn("Revenue Share %", format="%.1f%%"),
+    "Profile_Template": st.column_config.TextColumn("Profile Template"),
 }
 
 
@@ -743,8 +809,10 @@ def show_table(df, display_cols, download_name):
     )
 
 
-def network_metrics(df, annualize_factor=1.0):
-    """Display network-level summary metrics. GMROI and Turns are annualized."""
+def network_metrics(df, annualize_factor=1.0, inventory=None):
+    """Display network-level summary metrics. GMROI and Turns are annualized.
+    When inventory is provided, compute avg inventory from raw data (correct).
+    Otherwise falls back to summing group averages (approximate)."""
     if df.empty:
         st.info("No data matches current filters.")
         return
@@ -752,7 +820,12 @@ def network_metrics(df, annualize_factor=1.0):
     total_sales = df["Net_Sales"].sum()
     total_gm = df["Gross_Margin"].sum()
     total_cogs = df["COGS"].sum()
-    total_avg_inv = df["Avg_Inv_Cost"].sum()
+    if inventory is not None and len(inventory) > 0:
+        daily_total = inventory.groupby("Date", observed=True).agg(
+            Daily_Total=("Inventory Value", "sum")).reset_index()
+        total_avg_inv = daily_total["Daily_Total"].mean()
+    else:
+        total_avg_inv = df["Avg_Inv_Cost"].sum()
     gmroi = (total_gm / total_avg_inv * annualize_factor
              if total_avg_inv > 0 else 0)
     margin_pct = total_gm / total_sales * 100 if total_sales > 0 else 0
@@ -1210,6 +1283,7 @@ def main():
         "🎯 Portfolio",
         "🔀 Store Variance",
         "✅ Validation",
+        "🏆 Product Performance",
     ])
 
     # ── TAB 1: By Category ──
@@ -1219,7 +1293,7 @@ def main():
         st.markdown("---")
 
         cat_data = compute_gmroi(fsales, finv, ["Product Category"], annualize_factor)
-        network_metrics(cat_data, annualize_factor)
+        network_metrics(cat_data, annualize_factor, inventory=finv)
 
         if not cat_data.empty:
             st.markdown("---")
@@ -1247,7 +1321,7 @@ def main():
         st.markdown("---")
 
         brand_data = compute_gmroi(fsales, finv, ["Brand"], annualize_factor)
-        network_metrics(brand_data, annualize_factor)
+        network_metrics(brand_data, annualize_factor, inventory=finv)
 
         if not brand_data.empty:
             st.markdown("---")
@@ -1282,7 +1356,7 @@ def main():
         product_data = compute_gmroi(
             fsales, finv, ["Product", "Brand", "Product Category"],
             annualize_factor)
-        network_metrics(product_data, annualize_factor)
+        network_metrics(product_data, annualize_factor, inventory=finv)
 
         if not product_data.empty:
             st.markdown("---")
@@ -1308,7 +1382,7 @@ def main():
         st.markdown("---")
 
         shop_data = compute_gmroi(fsales, finv, ["Shop"], annualize_factor)
-        network_metrics(shop_data, annualize_factor)
+        network_metrics(shop_data, annualize_factor, inventory=finv)
 
         if not shop_data.empty:
             st.markdown("---")
@@ -1846,6 +1920,388 @@ to build confidence before using these numbers in presentations or reports.
                 st.markdown(f"- Brands excluded: {', '.join(IGNORE_VENDOR_CREDITS_BRANDS) if IGNORE_VENDOR_CREDITS_BRANDS else 'None'}")
             else:
                 st.warning("No vendor credits files found.")
+
+
+    # ── TAB 9: Product Performance ──
+    PP_CONFIG = {
+        "Units_Sold": st.column_config.NumberColumn("Units Sold", format="%,.0f"),
+        "Revenue": st.column_config.NumberColumn("Revenue", format="$%,.0f"),
+        "Gross_Profit": st.column_config.NumberColumn("Gross Profit", format="$%,.0f"),
+        "COGS": st.column_config.NumberColumn("COGS", format="$%,.0f"),
+        "Margin_Pct": st.column_config.NumberColumn("Margin %", format="%.1f%%"),
+        "Avg_Sell": st.column_config.NumberColumn("Avg Sell", format="$%,.2f"),
+        "Avg_Cost": st.column_config.NumberColumn("Avg Cost", format="$%,.2f"),
+        "Units_Share": st.column_config.NumberColumn("Units Share %", format="%.1f%%"),
+        "Revenue_Share": st.column_config.NumberColumn("Rev Share %", format="%.1f%%"),
+        "GP_Share": st.column_config.NumberColumn("GP Share %", format="%.1f%%"),
+        "GMROI": st.column_config.NumberColumn("GMROI", format="%.2f"),
+        "Inv_Turns": st.column_config.NumberColumn("Inv Turns", format="%.2f"),
+        "Avg_Inv_Cost": st.column_config.NumberColumn("Avg Inv Cost", format="$%,.0f"),
+    }
+
+    with tabs[8]:
+        st.subheader("Product Performance")
+
+        has_templates = ("Profile_Template" in sales.columns
+                         and (sales["Profile_Template"] != "Unmatched").any())
+
+        pp_mode = st.radio(
+            "Analysis mode:",
+            ["SKU Type Comparison", "Within-Brand SKU Review"],
+            horizontal=True, key="pp_mode")
+
+        if pp_mode == "SKU Type Comparison":
+            st.caption(
+                "Compare brands selling the same product type. "
+                "Select Profile Templates to define the comparison group."
+            )
+            if not has_templates:
+                st.warning("No Profile Template data. Rebuild from CSVs after "
+                           "adding data/catalog/profile_templates.csv.")
+            else:
+                matched_sales = sales[sales["Profile_Template"] != "Unmatched"]
+
+                # Category filter
+                all_cats = sorted(matched_sales["Product Category"].dropna()
+                                  .unique().tolist())
+                sel_cat = st.selectbox("Category:", ["All"] + all_cats,
+                                        key="pp_xb_cat")
+                if sel_cat != "All":
+                    matched_sales = matched_sales[
+                        matched_sales["Product Category"] == sel_cat]
+
+                # Template search + multiselect
+                all_templates = sorted(
+                    matched_sales["Profile_Template"].dropna().unique().tolist())
+                search = st.text_input("Search templates:", "",
+                                        key="pp_xb_search")
+                if search:
+                    filtered_templates = [t for t in all_templates
+                                          if search.lower() in str(t).lower()]
+                else:
+                    filtered_templates = all_templates
+
+                sel_templates = st.multiselect(
+                    "Select templates to compare:",
+                    filtered_templates, key="pp_xb_templates")
+
+                if sel_templates:
+                    # Review window
+                    col_w1, col_w2 = st.columns(2)
+                    review_days = col_w1.number_input(
+                        "Review window (days):", 30, 365, 90, 30,
+                        key="pp_xb_days")
+                    anchor = col_w2.radio(
+                        "Time anchor:", ["Last N days", "From first sale"],
+                        horizontal=True, key="pp_xb_anchor")
+
+                    # Filter to selected templates
+                    comp_sales = matched_sales[
+                        matched_sales["Profile_Template"].isin(sel_templates)]
+
+                    # Apply time window
+                    if anchor == "Last N days":
+                        cutoff = comp_sales["Date"].max() - pd.Timedelta(
+                            days=review_days)
+                    else:
+                        cutoff = comp_sales["Date"].min()
+                    end_dt = cutoff + pd.Timedelta(days=review_days)
+                    comp_sales = comp_sales[
+                        (comp_sales["Date"] >= cutoff)
+                        & (comp_sales["Date"] <= end_dt)]
+
+                    # Filter inventory to same window + matching products
+                    comp_products = comp_sales["Product"].unique()
+                    inv_name_col = ("Product Name" if "Product Name"
+                                    in inventory.columns else "Product")
+                    comp_inv = inventory[
+                        (inventory["Date"] >= cutoff)
+                        & (inventory["Date"] <= end_dt)
+                        & (inventory[inv_name_col].isin(comp_products))]
+
+                    if len(comp_sales) == 0:
+                        st.warning("No sales in selected window.")
+                    else:
+                        st.markdown("---")
+
+                        # ── Share charts ──
+                        brand_agg = compute_share_metrics(
+                            comp_sales, ["Brand", "Profile_Template"],
+                            annualize_factor, inventory=comp_inv)
+
+                        ch1, ch2 = st.columns(2)
+                        with ch1:
+                            fig = px.pie(brand_agg, values="Units_Sold",
+                                         names="Brand", hole=0.4,
+                                         title="Units Sold Share")
+                            fig.update_layout(height=320, margin=dict(t=40, b=0))
+                            st.plotly_chart(fig, use_container_width=True)
+                        with ch2:
+                            fig = px.pie(brand_agg, values="Gross_Profit",
+                                         names="Brand", hole=0.4,
+                                         title="Gross Profit Share")
+                            fig.update_layout(height=320, margin=dict(t=40, b=0))
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        # ── GMROI + Turns bar chart ──
+                        if "GMROI" in brand_agg.columns:
+                            gmroi_data = brand_agg.dropna(
+                                subset=["GMROI", "Inv_Turns"])
+                            if not gmroi_data.empty:
+                                fig = go.Figure()
+                                fig.add_trace(go.Bar(
+                                    y=gmroi_data["Brand"].astype(str),
+                                    x=gmroi_data["GMROI"],
+                                    name="GMROI", orientation='h'))
+                                fig.add_trace(go.Bar(
+                                    y=gmroi_data["Brand"].astype(str),
+                                    x=gmroi_data["Inv_Turns"],
+                                    name="Inv Turns", orientation='h'))
+                                fig.update_layout(
+                                    barmode='group', title="GMROI and Inv Turns by Brand",
+                                    xaxis_title="", yaxis_title="",
+                                    height=max(280, len(gmroi_data) * 50))
+                                st.plotly_chart(fig, use_container_width=True)
+
+                        # ── Brand summary table ──
+                        st.markdown("### Brand Summary")
+                        brand_cols = [
+                            "Brand", "Profile_Template", "Units_Sold",
+                            "Revenue", "Gross_Profit", "Margin_Pct",
+                            "Avg_Inv_Cost", "GMROI", "Inv_Turns",
+                            "Avg_Sell", "Avg_Cost",
+                            "Units_Share", "GP_Share"]
+                        avail = [c for c in brand_cols
+                                 if c in brand_agg.columns]
+                        st.dataframe(brand_agg[avail],
+                                      use_container_width=True,
+                                      hide_index=True,
+                                      column_config=PP_CONFIG)
+
+                        # ── Store breakdown: units vs % share ──
+                        st.markdown("### Store Breakdown")
+                        pivot = build_store_matrix(
+                            comp_sales, "Brand", "Quantity Sold")
+                        pct = pivot.drop(columns=["Total"]).div(
+                            pivot["Total"], axis=0) * 100
+
+                        store_view = st.radio(
+                            "View:", ["Units", "% of Store Total"],
+                            horizontal=True, key="pp_xb_store_view")
+
+                        if store_view == "% of Store Total":
+                            # Heatmap
+                            fig = px.imshow(
+                                pct.values,
+                                x=[str(c) for c in pct.columns],
+                                y=[str(i) for i in pct.index],
+                                color_continuous_scale="YlOrRd",
+                                labels=dict(color="% Share"),
+                                title="Market Share by Store (%)",
+                                text_auto=".1f")
+                            fig.update_layout(
+                                height=max(350, len(pct) * 40))
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.dataframe(pivot, use_container_width=True)
+                            # Stacked bar
+                            brands_in_data = [c for c in pivot.columns
+                                              if c != "Total"]
+                            if brands_in_data:
+                                fig = go.Figure()
+                                for brand in brands_in_data:
+                                    fig.add_trace(go.Bar(
+                                        y=pivot.index.astype(str),
+                                        x=pivot[brand],
+                                        name=str(brand),
+                                        orientation='h'))
+                                fig.update_layout(
+                                    barmode='stack',
+                                    title="Units Sold by Store",
+                                    xaxis_title="Units Sold",
+                                    yaxis_title="",
+                                    height=max(350, len(pivot) * 35))
+                                st.plotly_chart(fig, use_container_width=True)
+
+                        # ── Individual product drill-down ──
+                        st.markdown("### Individual Products")
+                        sel_drill_brand = st.selectbox(
+                            "Drill into brand:",
+                            sorted(comp_sales["Brand"].unique().tolist()),
+                            key="pp_xb_drill")
+                        drill_sales = comp_sales[
+                            comp_sales["Brand"] == sel_drill_brand]
+                        drill_products = drill_sales["Product"].unique()
+                        drill_inv = comp_inv[
+                            comp_inv[inv_name_col].isin(drill_products)
+                        ] if len(comp_inv) > 0 else comp_inv
+                        prod_agg = compute_share_metrics(
+                            drill_sales, ["Product"], annualize_factor,
+                            inventory=drill_inv)
+                        prod_cols = [
+                            "Product", "Units_Sold", "Revenue",
+                            "Gross_Profit", "Margin_Pct",
+                            "Avg_Inv_Cost", "GMROI", "Inv_Turns",
+                            "Avg_Sell", "Avg_Cost", "Units_Share"]
+                        avail_p = [c for c in prod_cols
+                                   if c in prod_agg.columns]
+                        st.dataframe(prod_agg[avail_p],
+                                      use_container_width=True,
+                                      hide_index=True,
+                                      column_config=PP_CONFIG)
+                else:
+                    st.info("Select one or more templates above to run the "
+                            "comparison.")
+
+        else:  # Within-Brand SKU Review
+            st.caption(
+                "Compare SKU types within a single brand. "
+                "Use when a product has no direct competitor."
+            )
+            if not has_templates:
+                st.warning("No Profile Template data.")
+            else:
+                matched_sales = sales[sales["Profile_Template"] != "Unmatched"]
+                all_brands = sorted(
+                    matched_sales["Brand"].dropna().unique().tolist())
+                sel_brand = st.selectbox("Brand:", all_brands,
+                                          key="pp_sku_brand")
+                brand_sales = matched_sales[
+                    matched_sales["Brand"] == sel_brand]
+
+                # Review window
+                col_w1, col_w2 = st.columns(2)
+                review_days = col_w1.number_input(
+                    "Review window (days):", 30, 365, 90, 30,
+                    key="pp_sku_days")
+                anchor = col_w2.radio(
+                    "Time anchor:", ["Last N days", "From first sale"],
+                    horizontal=True, key="pp_sku_anchor")
+
+                if anchor == "Last N days":
+                    cutoff = brand_sales["Date"].max() - pd.Timedelta(
+                        days=review_days)
+                else:
+                    cutoff = brand_sales["Date"].min()
+                end_dt = cutoff + pd.Timedelta(days=review_days)
+                brand_sales = brand_sales[
+                    (brand_sales["Date"] >= cutoff)
+                    & (brand_sales["Date"] <= end_dt)]
+
+                # Filter inventory for this brand's products + window
+                brand_products = brand_sales["Product"].unique()
+                inv_name_col = ("Product Name" if "Product Name"
+                                in inventory.columns else "Product")
+                brand_inv = inventory[
+                    (inventory["Date"] >= cutoff)
+                    & (inventory["Date"] <= end_dt)
+                    & (inventory[inv_name_col].isin(brand_products))]
+
+                if len(brand_sales) == 0:
+                    st.warning("No sales in selected window.")
+                else:
+                    st.markdown("---")
+
+                    # ── Template summary with charts ──
+                    tmpl_agg = compute_share_metrics(
+                        brand_sales, ["Profile_Template"], annualize_factor,
+                        inventory=brand_inv)
+
+                    # Share donuts
+                    if len(tmpl_agg) > 1:
+                        ch1, ch2 = st.columns(2)
+                        with ch1:
+                            fig = px.pie(tmpl_agg, values="Units_Sold",
+                                         names="Profile_Template", hole=0.4,
+                                         title="Units Sold Share")
+                            fig.update_layout(height=320,
+                                              margin=dict(t=40, b=0))
+                            st.plotly_chart(fig, use_container_width=True)
+                        with ch2:
+                            fig = px.pie(tmpl_agg, values="Gross_Profit",
+                                         names="Profile_Template", hole=0.4,
+                                         title="Gross Profit Share")
+                            fig.update_layout(height=320,
+                                              margin=dict(t=40, b=0))
+                            st.plotly_chart(fig, use_container_width=True)
+
+                    # GMROI + Turns bar
+                    if "GMROI" in tmpl_agg.columns:
+                        gdata = tmpl_agg.dropna(subset=["GMROI", "Inv_Turns"])
+                        if not gdata.empty:
+                            fig = go.Figure()
+                            fig.add_trace(go.Bar(
+                                y=gdata["Profile_Template"].astype(str),
+                                x=gdata["GMROI"],
+                                name="GMROI", orientation='h'))
+                            fig.add_trace(go.Bar(
+                                y=gdata["Profile_Template"].astype(str),
+                                x=gdata["Inv_Turns"],
+                                name="Inv Turns", orientation='h'))
+                            fig.update_layout(
+                                barmode='group',
+                                title=f"{sel_brand}: GMROI and Inv Turns",
+                                height=max(280, len(gdata) * 50))
+                            st.plotly_chart(fig, use_container_width=True)
+
+                    # Summary table
+                    st.markdown("### SKU Type Summary")
+                    tmpl_cols = [
+                        "Profile_Template", "Units_Sold", "Revenue",
+                        "Gross_Profit", "Margin_Pct",
+                        "Avg_Inv_Cost", "GMROI", "Inv_Turns",
+                        "Avg_Sell", "Avg_Cost",
+                        "Units_Share", "Revenue_Share"]
+                    avail_t = [c for c in tmpl_cols
+                               if c in tmpl_agg.columns]
+                    st.dataframe(tmpl_agg[avail_t],
+                                  use_container_width=True,
+                                  hide_index=True,
+                                  column_config=PP_CONFIG)
+
+                    # ── Store breakdown: units vs % share ──
+                    st.markdown("### Store Breakdown")
+                    pivot = build_store_matrix(
+                        brand_sales, "Profile_Template", "Quantity Sold")
+                    pct = pivot.drop(columns=["Total"]).div(
+                        pivot["Total"], axis=0) * 100
+
+                    store_view = st.radio(
+                        "View:", ["Units", "% of Store Total"],
+                        horizontal=True, key="pp_sku_store_view")
+
+                    if store_view == "% of Store Total":
+                        fig = px.imshow(
+                            pct.values,
+                            x=[str(c) for c in pct.columns],
+                            y=[str(i) for i in pct.index],
+                            color_continuous_scale="YlOrRd",
+                            labels=dict(color="% Share"),
+                            title="SKU Type Share by Store (%)",
+                            text_auto=".1f")
+                        fig.update_layout(
+                            height=max(350, len(pct) * 40))
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.dataframe(pivot, use_container_width=True)
+
+                    # ── Weekly trend ──
+                    st.markdown("### Weekly Trend")
+                    weekly = (brand_sales
+                              .groupby([pd.Grouper(key="Date", freq="W"),
+                                        "Profile_Template"],
+                                       observed=True)
+                              .agg(Units_Sold=("Quantity Sold", "sum"))
+                              .reset_index())
+                    if not weekly.empty:
+                        fig = px.line(
+                            weekly, x="Date", y="Units_Sold",
+                            color="Profile_Template",
+                            labels={"Profile_Template": "SKU Type",
+                                    "Units_Sold": "Weekly Units Sold"},
+                            title=f"{sel_brand}: Weekly Units Sold by SKU Type")
+                        fig.update_layout(height=400)
+                        st.plotly_chart(fig, use_container_width=True)
 
 
 if __name__ == "__main__":
