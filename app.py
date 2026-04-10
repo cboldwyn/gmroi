@@ -1947,7 +1947,8 @@ to build confidence before using these numbers in presentations or reports.
 
         pp_mode = st.radio(
             "Analysis mode:",
-            ["SKU Type Comparison", "Within-Brand SKU Review"],
+            ["SKU Type Comparison", "Within-Brand SKU Review",
+             "Data Quality"],
             horizontal=True, key="pp_mode")
 
         if pp_mode == "SKU Type Comparison":
@@ -2011,13 +2012,19 @@ to build confidence before using these numbers in presentations or reports.
                         & (comp_sales["Date"] <= end_dt)]
 
                     # Filter inventory to same window + matching products
+                    # Map Profile_Template onto inventory so groupby works
                     comp_products = comp_sales["Product"].unique()
                     inv_name_col = ("Product Name" if "Product Name"
                                     in inventory.columns else "Product")
                     comp_inv = inventory[
                         (inventory["Date"] >= cutoff)
                         & (inventory["Date"] <= end_dt)
-                        & (inventory[inv_name_col].isin(comp_products))]
+                        & (inventory[inv_name_col].isin(comp_products))].copy()
+                    prod_tmpl_map = (comp_sales[["Product", "Profile_Template"]]
+                                    .drop_duplicates()
+                                    .set_index("Product")["Profile_Template"])
+                    comp_inv["Profile_Template"] = (
+                        comp_inv[inv_name_col].map(prod_tmpl_map))
 
                     if len(comp_sales) == 0:
                         st.warning("No sales in selected window.")
@@ -2153,7 +2160,7 @@ to build confidence before using these numbers in presentations or reports.
                     st.info("Select one or more templates above to run the "
                             "comparison.")
 
-        else:  # Within-Brand SKU Review
+        elif pp_mode == "Within-Brand SKU Review":
             st.caption(
                 "Compare SKU types within a single brand. "
                 "Use when a product has no direct competitor."
@@ -2189,13 +2196,19 @@ to build confidence before using these numbers in presentations or reports.
                     & (brand_sales["Date"] <= end_dt)]
 
                 # Filter inventory for this brand's products + window
+                # Map Profile_Template onto inventory so groupby works
                 brand_products = brand_sales["Product"].unique()
                 inv_name_col = ("Product Name" if "Product Name"
                                 in inventory.columns else "Product")
                 brand_inv = inventory[
                     (inventory["Date"] >= cutoff)
                     & (inventory["Date"] <= end_dt)
-                    & (inventory[inv_name_col].isin(brand_products))]
+                    & (inventory[inv_name_col].isin(brand_products))].copy()
+                prod_tmpl_map = (brand_sales[["Product", "Profile_Template"]]
+                                .drop_duplicates()
+                                .set_index("Product")["Profile_Template"])
+                brand_inv["Profile_Template"] = (
+                    brand_inv[inv_name_col].map(prod_tmpl_map))
 
                 if len(brand_sales) == 0:
                     st.warning("No sales in selected window.")
@@ -2302,6 +2315,115 @@ to build confidence before using these numbers in presentations or reports.
                             title=f"{sel_brand}: Weekly Units Sold by SKU Type")
                         fig.update_layout(height=400)
                         st.plotly_chart(fig, use_container_width=True)
+
+        elif pp_mode == "Data Quality":
+            st.caption("Audit matching, unmatched products, and vendor credits.")
+
+            if "Profile_Template" not in sales.columns:
+                st.warning("No Profile Template data.")
+            else:
+                # Match rate summary
+                total = len(sales)
+                matched = (sales["Profile_Template"] != "Unmatched").sum()
+                unmatched_n = total - matched
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Rows", f"{total:,}")
+                c2.metric("Matched", f"{matched:,} ({matched/total*100:.1f}%)")
+                c3.metric("Unmatched", f"{unmatched_n:,} ({unmatched_n/total*100:.1f}%)")
+
+                st.markdown("---")
+
+                # Unmatched by brand
+                st.markdown("### Unmatched Products by Brand")
+                unmatched = sales[sales["Profile_Template"] == "Unmatched"]
+                brand_counts = (unmatched.groupby("Brand", observed=True)
+                                .agg(Rows=("Product", "size"),
+                                     Products=("Product", "nunique"),
+                                     Revenue=("Net Sales", "sum"))
+                                .reset_index()
+                                .sort_values("Rows", ascending=False))
+                brand_counts_cfg = {
+                    "Rows": st.column_config.NumberColumn("Rows", format="%,.0f"),
+                    "Products": st.column_config.NumberColumn("Products", format="%d"),
+                    "Revenue": st.column_config.NumberColumn("Revenue", format="$%,.0f"),
+                }
+                st.dataframe(brand_counts.head(30), use_container_width=True,
+                              hide_index=True, column_config=brand_counts_cfg)
+
+                # Drill into unmatched products
+                st.markdown("### Unmatched Product Detail")
+                um_brand = st.selectbox(
+                    "Filter by brand:",
+                    ["All"] + sorted([b for b in unmatched["Brand"].unique().tolist()
+                                      if pd.notna(b)]),
+                    key="pp_dq_brand")
+                um_view = unmatched if um_brand == "All" else unmatched[
+                    unmatched["Brand"] == um_brand]
+                um_detail = (um_view.groupby(
+                    ["Brand", "Product", "Product Category"], observed=True)
+                    .agg(Units=("Quantity Sold", "sum"),
+                         Revenue=("Net Sales", "sum"))
+                    .reset_index()
+                    .sort_values("Revenue", ascending=False))
+                st.dataframe(um_detail.head(50), use_container_width=True,
+                              hide_index=True, column_config={
+                    "Units": st.column_config.NumberColumn(format="%,.0f"),
+                    "Revenue": st.column_config.NumberColumn(format="$%,.0f"),
+                })
+
+                # Vendor Credits audit
+                st.markdown("---")
+                st.markdown("### Vendor Credits Audit")
+                has_credits = ("Vendor_Pays" in sales.columns
+                               and sales["Vendor_Pays"].sum() > 0)
+                if has_credits:
+                    credit_sales = sales[sales["Vendor_Pays"] > 0]
+                    total_credits = credit_sales["Vendor_Pays"].sum()
+                    total_haven = credit_sales["Haven_Pays"].sum()
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Total Vendor Credits",
+                              f"${total_credits:,.0f}")
+                    c2.metric("Haven Pays", f"${total_haven:,.0f}")
+                    c3.metric("Rows with Credits",
+                              f"{len(credit_sales):,}")
+
+                    # Credits by brand
+                    credit_by_brand = (credit_sales
+                        .groupby("Brand", observed=True)
+                        .agg(Vendor_Credits=("Vendor_Pays", "sum"),
+                             Haven_Pays=("Haven_Pays", "sum"),
+                             Rows=("Product", "size"),
+                             Net_Sales=("Net Sales", "sum"))
+                        .reset_index()
+                        .sort_values("Vendor_Credits", ascending=False))
+                    credit_by_brand["Credit_Pct"] = (
+                        credit_by_brand["Vendor_Credits"]
+                        / credit_by_brand["Net_Sales"] * 100)
+                    st.dataframe(credit_by_brand.head(20),
+                                  use_container_width=True,
+                                  hide_index=True, column_config={
+                        "Vendor_Credits": st.column_config.NumberColumn(
+                            "Vendor Credits", format="$%,.0f"),
+                        "Haven_Pays": st.column_config.NumberColumn(
+                            "Haven Pays", format="$%,.0f"),
+                        "Rows": st.column_config.NumberColumn(format="%,.0f"),
+                        "Net_Sales": st.column_config.NumberColumn(
+                            "Net Sales", format="$%,.0f"),
+                        "Credit_Pct": st.column_config.NumberColumn(
+                            "Credit %", format="%.1f%%"),
+                    })
+
+                    # Check: credits on unmatched products
+                    um_credits = credit_sales[
+                        credit_sales["Profile_Template"] == "Unmatched"]
+                    if len(um_credits) > 0:
+                        st.warning(
+                            f"**{len(um_credits):,} credit rows "
+                            f"(${um_credits['Vendor_Pays'].sum():,.0f}) "
+                            f"are on unmatched products.** These won't "
+                            f"appear in Product Performance comparisons.")
+                else:
+                    st.info("No vendor credit data in current dataset.")
 
 
 if __name__ == "__main__":
