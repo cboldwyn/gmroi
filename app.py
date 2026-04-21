@@ -1793,8 +1793,11 @@ to build confidence before using these numbers in presentations or reports.
                 Net_Sales=("Net Sales", "sum"),
                 Qty_Sold=("Quantity Sold", "sum"),
                 Transactions=("Trans No", "nunique"),
-                Avg_Sell_Price=("Effective Retail Price", "mean"),
             ).reset_index().sort_values("Net_Sales", ascending=False).head(30)
+            # Realized ASP: consistent with Net_Sales / Qty_Sold
+            brand_sales["Avg_Sell_Price"] = np.where(
+                brand_sales["Qty_Sold"] > 0,
+                brand_sales["Net_Sales"] / brand_sales["Qty_Sold"], 0)
 
             config = {
                 "Net_Sales": st.column_config.NumberColumn("Net Sales", format="$%,.0f"),
