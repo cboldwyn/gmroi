@@ -498,6 +498,31 @@ def match_products_to_templates(products_df, catalog_df):
                 elif cat in ('Vape', 'Extract'):
                     matched, _ = _match_vape_extract(product, templates, cat)
 
+        if not matched:
+            matched = _auto_template(product, brand, cat)
+
         result[(product, brand)] = matched if matched else 'Unmatched'
 
     return result
+
+
+def _auto_template(product, brand, category):
+    """Generate a synthetic template for unmatched products.
+
+    Groups by Brand + normalized category + weight so unmatched products
+    still roll up meaningfully in Product Performance views.
+    E.g. "Coastal Cowboys - Blueberry Kush 28g" -> "Coastal Cowboys - Flower 28g"
+    """
+    if pd.isna(brand) or pd.isna(product):
+        return None
+
+    weight = extract_weight(product)
+    pack = extract_pack_size(product)
+
+    parts = [str(brand), "-", category]
+    if pack:
+        parts.append(pack)
+    if weight:
+        parts.append(weight)
+
+    return " ".join(parts)
