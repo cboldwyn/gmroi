@@ -32,14 +32,14 @@ IGNORE_VENDOR_CREDITS_BRANDS = ['Stiiizy']
 # Only load columns the app actually uses (113 -> ~15 for sales, 23 -> 8 for inventory).
 # This cuts memory from ~10 GB to ~1 GB for a full-year dataset.
 SALES_CSV_COLS = [
-    "Date", "Shop", "Product", "Product ID", "Product Category", "Brand",
-    "Trans No", "Trans Status", "Trans Type", "Unique ID",
+    "Date", "Shop", "Product", "Product Category", "Brand",
+    "Trans No", "Trans Status", "Trans Type",
     "Quantity Sold", "Unit Cost", "Net Sales", "Effective Retail Price",
 ]
 
-# Columns kept after build-time filtering/dedup (dropped: Trans Status, Trans Type,
-# Unique ID, Product ID -- only needed during build)
-SALES_DROP_AFTER_BUILD = ["Trans Status", "Trans Type", "Unique ID", "Product ID"]
+# Columns kept after build-time filtering (dropped: Trans Status, Trans Type
+# -- only needed during build)
+SALES_DROP_AFTER_BUILD = ["Trans Status", "Trans Type"]
 
 INVENTORY_CSV_COLS = [
     "Date", "Shop", "Product Name", "Product Category", "Brand",
@@ -77,11 +77,9 @@ def build_from_csvs(sales_dir, inventory_dir, credits_pattern, version=""):
         if col in sales.columns:
             sales[col] = pd.to_numeric(sales[col], errors="coerce").fillna(0)
 
-    if "Unique ID" in sales.columns and "Trans No" in sales.columns:
-        sales = sales.drop_duplicates(
-            subset=["Date", "Shop", "Trans No", "Unique ID", "Product ID"],
-            keep="first"
-        )
+    # No dedup: each weekly CSV is a self-contained Blaze export with no
+    # cross-file overlap.  Multi-unit purchases from the same METRC package
+    # share (Trans No, Unique ID, Product ID) but are distinct line items.
 
     if "Trans Status" in sales.columns:
         sales = sales[sales["Trans Status"] == "Completed"]

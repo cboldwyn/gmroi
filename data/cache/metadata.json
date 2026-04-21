@@ -1,10 +1,10 @@
 {
-  "build_timestamp": "2026-04-08T19:28:26.555318",
-  "app_version": "2.4.0",
+  "build_timestamp": "2026-04-14T18:30:17.031008",
+  "app_version": "2.4.1",
   "sales_file_count": 67,
   "inventory_file_count": 67,
   "credits_file_count": 2,
-  "sales_row_count": 3211764,
+  "sales_row_count": 3488298,
   "inventory_row_count": 1218229,
   "sales_date_range": [
     "2025-01-01",
