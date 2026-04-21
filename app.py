@@ -73,7 +73,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.3.0"
+VERSION = "2.4.2"
 
 st.set_page_config(
     page_title=f"GMROI Dashboard v{VERSION}",
