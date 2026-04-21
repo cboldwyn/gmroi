@@ -492,6 +492,18 @@ def apply_adjustments_to_sales(sales, nonvape_override=None):
 # COMPUTATION
 # ============================================================================
 
+def calc_annualize_factor(df, date_col="Date"):
+    """Compute 365-day annualization factor from a date-filtered DataFrame.
+
+    Every GMROI/Turns display must be annualized against the window it covers.
+    Call this on the DataFrame that was actually used to compute the metric
+    (not a parent/sidebar-scoped DataFrame)."""
+    if df is None or len(df) == 0:
+        return 1.0
+    actual_days = (df[date_col].max() - df[date_col].min()).days + 1
+    return 365 / actual_days if actual_days > 0 else 1.0
+
+
 def compute_gmroi(sales, inventory, group_cols, annualize_factor=1.0):
     """Compute GMROI for given grouping columns. COGS includes vendor credits.
     annualize_factor: multiply GMROI and Turns to normalize to annual basis
@@ -504,13 +516,17 @@ def compute_gmroi(sales, inventory, group_cols, annualize_factor=1.0):
         COGS=("COGS_Calc", "sum"),
         Qty_Sold=("Quantity Sold", "sum"),
         Transactions=("Trans No", "nunique"),
-        Avg_Sell_Price=("Effective Retail Price", "mean"),
         Avg_Unit_Cost=("Unit Cost", "mean"),
         Vendor_Credits=("Vendor_Pays", "sum"),
         **({
             "COGS_Adj": ("COGS_Adjustment", "sum"),
         } if "COGS_Adjustment" in sales.columns else {}),
     ).reset_index()
+
+    # Realized ASP: consistent with Net_Sales and Qty_Sold shown in the same row.
+    sales_agg["Avg_Sell_Price"] = np.where(
+        sales_agg["Qty_Sold"] > 0,
+        sales_agg["Net_Sales"] / sales_agg["Qty_Sold"], 0)
 
     sales_agg["Gross_Margin"] = sales_agg["Net_Sales"] - sales_agg["COGS"]
     sales_agg["Margin_Pct"] = np.where(
@@ -639,9 +655,11 @@ def compute_share_metrics(sales, group_cols, annualize_factor=1.0,
         Units_Sold=("Quantity Sold", "sum"),
         Revenue=("Net Sales", "sum"),
         COGS=("COGS_Calc", "sum"),
-        Avg_Sell=("Effective Retail Price", "mean"),
         Avg_Cost=("Unit Cost", "mean"),
     ).reset_index()
+    # Realized ASP: consistent with Revenue and Units_Sold shown in the same row.
+    agg["Avg_Sell"] = np.where(agg["Units_Sold"] > 0,
+                                agg["Revenue"] / agg["Units_Sold"], 0)
     agg["Gross_Profit"] = agg["Revenue"] - agg["COGS"]
     total_units = agg["Units_Sold"].sum()
     total_rev = agg["Revenue"].sum()
@@ -1131,8 +1149,7 @@ def main():
 
     # Annualization factor: normalize GMROI and Turns to a 365-day basis
     # so that Q1, Q2, YTD, and full-year periods are directly comparable.
-    actual_days = (sales["Date"].max() - sales["Date"].min()).days + 1
-    annualize_factor = 365 / actual_days if actual_days > 0 else 1.0
+    annualize_factor = calc_annualize_factor(sales)
 
     if selected_tf == "All Data":
         st.markdown("Gross Margin Return on Inventory Investment - Haven")
@@ -2029,12 +2046,14 @@ to build confidence before using these numbers in presentations or reports.
                     if len(comp_sales) == 0:
                         st.warning("No sales in selected window.")
                     else:
+                        # Annualize against the review window, not the sidebar timeframe
+                        comp_ann_factor = calc_annualize_factor(comp_sales)
                         st.markdown("---")
 
                         # ── Share charts ──
                         brand_agg = compute_share_metrics(
                             comp_sales, ["Brand", "Profile_Template"],
-                            annualize_factor, inventory=comp_inv)
+                            comp_ann_factor, inventory=comp_inv)
 
                         ch1, ch2 = st.columns(2)
                         with ch1:
@@ -2143,7 +2162,7 @@ to build confidence before using these numbers in presentations or reports.
                             comp_inv[inv_name_col].isin(drill_products)
                         ] if len(comp_inv) > 0 else comp_inv
                         prod_agg = compute_share_metrics(
-                            drill_sales, ["Product"], annualize_factor,
+                            drill_sales, ["Product"], comp_ann_factor,
                             inventory=drill_inv)
                         prod_cols = [
                             "Product", "Units_Sold", "Revenue",
@@ -2213,11 +2232,13 @@ to build confidence before using these numbers in presentations or reports.
                 if len(brand_sales) == 0:
                     st.warning("No sales in selected window.")
                 else:
+                    # Annualize against the review window, not the sidebar timeframe
+                    brand_ann_factor = calc_annualize_factor(brand_sales)
                     st.markdown("---")
 
                     # ── Template summary with charts ──
                     tmpl_agg = compute_share_metrics(
-                        brand_sales, ["Profile_Template"], annualize_factor,
+                        brand_sales, ["Profile_Template"], brand_ann_factor,
                         inventory=brand_inv)
 
                     # Share donuts
